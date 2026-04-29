@@ -106,37 +106,22 @@ jobs:
 
       - name: Britive checkout (GitHub OIDC -> Britive -> GCP)
         run: |
-          # `-m gcloudauth` mode returns text including a `gcloud auth activate-service-account`
-          # command we extract + run. (json/gcloudauthexec modes don't work for WIF profiles.)
-          set +e
+          # WIF profiles only support `-m json` (returns {sa_email: keyJson_str}).
+          # Unwrap to the inner SA key JSON and feed it to gcloud.
+          mkdir -p ~/.gcp
           pybritive configure update profile-aliases gcp-default "$GCP_PROFILE"
-          CHECKOUT_RC=0
-          CHECKOUT_OUT=$(pybritive checkout gcp-default -m gcloudauth -P "$BRITIVE_FED_PROVIDER" 2>&1) || CHECKOUT_RC=$?
-          echo "::group::pybritive checkout (rc=$CHECKOUT_RC, sensitive content masked)"
-          echo "$CHECKOUT_OUT" | sed -E 's/(BEGIN PRIVATE KEY).*?(END PRIVATE KEY)/\1...REDACTED...\2/g' | head -30
-          echo "::endgroup::"
-          [ $CHECKOUT_RC -ne 0 ] && { echo "::error::pybritive checkout failed"; exit $CHECKOUT_RC; }
-          if echo "$CHECKOUT_OUT" | grep -q '^gcloud auth activate-service-account'; then
-            echo "$CHECKOUT_OUT" | grep '^gcloud auth activate-service-account' > /tmp/gcloud-login.sh
-            chmod +x /tmp/gcloud-login.sh
-            /tmp/gcloud-login.sh
-          else
-            echo "::error::No 'gcloud auth activate-service-account' line in pybritive output"
-            exit 1
-          fi
+          pybritive checkout gcp-default -m json -P "$BRITIVE_FED_PROVIDER" --silent | \
+            python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); sys.stdout.write(list(d.values())[0])' \
+            > ~/.gcp/sa-key.json
+          test -s ~/.gcp/sa-key.json || { echo "::error::Empty SA key file"; exit 1; }
+          gcloud auth activate-service-account --key-file=$HOME/.gcp/sa-key.json
           gcloud config set project openloop-poc-core
-          gcloud auth list
 
-      - name: Self-bootstrap bucket permissions for the shadow SA
-        run: |
-          # Britive's federated SI checkout for GCP-WIF profiles returns a shadow SA + key
-          # but doesn't always cascade folder-level role bindings to the shadow SA's view of
-          # specific buckets. Self-grant bucket-level permissions using the role Britive DID
-          # grant (storage.admin includes setIamPolicy).
-          CURRENT_SA=$(gcloud config list account --format='value(core.account)')
-          echo "Shadow SA: $CURRENT_SA"
-          gsutil iam ch "serviceAccount:$CURRENT_SA:objectAdmin" "gs://${GCS_BUCKET}" || echo "objectAdmin grant failed"
-          gsutil iam ch "serviceAccount:$CURRENT_SA:legacyBucketWriter" "gs://${GCS_BUCKET}" || echo "legacyBucketWriter grant failed"
+      - name: Wait for IAM propagation
+        # Britive attaches roles/storage.admin at folder scope on checkout, but Google's
+        # IAM evaluation cache for newly-created SAs takes ~20-40s to recognize the binding.
+        # Without this wait, the first GCS API call returns 403.
+        run: sleep 45
 
       - name: Write per-run file to GCS
         run: |
