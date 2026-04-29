@@ -77,9 +77,19 @@ jobs:
           auth_path:     GitHub OIDC -> Britive (federated SI) -> GCP storage-admin
           static_creds:  none
           EOF
-          gcloud storage cp /tmp/payload.txt \
-            "gs://${GCS_BUCKET}/jit-demo/gcp-run-${{ github.run_id }}.txt"
-          echo "::notice::Wrote gs://${GCS_BUCKET}/jit-demo/gcp-run-${{ github.run_id }}.txt"
+          # Britive grants the storage role at checkout time; IAM propagation
+          # takes a few seconds. Retry up to 5 times with backoff.
+          DEST="gs://${GCS_BUCKET}/jit-demo/gcp-run-${{ github.run_id }}.txt"
+          for i in 1 2 3 4 5; do
+            if gcloud storage cp /tmp/payload.txt "$DEST"; then
+              echo "::notice::Wrote $DEST (attempt $i)"
+              exit 0
+            fi
+            echo "Attempt $i failed; waiting for IAM propagation..."
+            sleep 6
+          done
+          echo "::error::All retries failed"
+          exit 1
 
       - name: Britive checkin
         if: always()
