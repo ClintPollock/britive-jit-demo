@@ -119,9 +119,9 @@ jobs:
 
       - name: Wait for IAM propagation
         # Britive attaches roles/storage.admin at folder scope on checkout, but Google's
-        # IAM evaluation cache for newly-created SAs takes ~20-40s to recognize the binding.
-        # Without this wait, the first GCS API call returns 403.
-        run: sleep 45
+        # IAM evaluation cache for newly-created SAs is slow to recognize the binding.
+        # Local test (token-based SI): ~30s. GH Actions (federated SI): seems longer.
+        run: sleep 90
 
       - name: Write per-run file to GCS
         run: |
