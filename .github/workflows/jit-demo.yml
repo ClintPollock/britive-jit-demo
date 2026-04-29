@@ -82,6 +82,13 @@ jobs:
           aws s3 cp /tmp/payload.txt "s3://${S3_BUCKET}/jit-demo/aws-run-${{ github.run_id }}.txt"
           echo "::notice::Wrote s3://${S3_BUCKET}/jit-demo/aws-run-${{ github.run_id }}.txt"
 
+      - name: List recent files (proof of past runs)
+        run: |
+          echo "Last 10 files in s3://${S3_BUCKET}/jit-demo/:"
+          aws s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix jit-demo/ \
+            --query 'reverse(sort_by(Contents,&LastModified))[:10].[LastModified,Size,Key]' \
+            --output table
+
       - name: Britive checkin
         if: always()
         run: pybritive checkin "$AWS_PROFILE_PATH" || true
@@ -139,6 +146,11 @@ jobs:
           EOF
           gsutil cp /tmp/payload.txt "gs://${GCS_BUCKET}/jit-demo/gcp-run-${{ github.run_id }}.txt"
           echo "::notice::Wrote gs://${GCS_BUCKET}/jit-demo/gcp-run-${{ github.run_id }}.txt"
+
+      - name: List recent files (proof of past runs)
+        run: |
+          echo "Last 10 files in gs://${GCS_BUCKET}/jit-demo/:"
+          gsutil ls -l "gs://${GCS_BUCKET}/jit-demo/**" 2>/dev/null | sort -r | head -10 || true
 
       - name: Britive checkin
         if: always()
