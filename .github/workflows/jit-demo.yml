@@ -1,0 +1,133 @@
+name: openloop-jit-demo
+
+# Demonstrates GitHub OIDC -> Britive (federated SI) -> [GCP, AWS]
+# with no static credentials anywhere.
+#
+# - GitHub mints an OIDC token per workflow run (built-in, no setup)
+# - pybritive trades that token for a Britive session (federation IdP "GitHub")
+# - pybritive checks out a profile in Britive, gets short-lived cloud creds
+# - cloud CLI writes a per-run file to a demo bucket
+# - pybritive checks the profile back in -> credentials revoked
+#
+# Required GitHub repo settings:
+#   - permissions.id-token: write   (set in this file, no extra config)
+# No GitHub Secrets required. No long-lived creds anywhere.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  BRITIVE_TENANT: openloop-poc
+  GCP_PROFILE: 'Google Cloud/clintpollock27-org/openloop-poc/OpenLoop POC Core/openloop-pov-gcp-storage-admin'
+  AWS_PROFILE_PATH: 'AWS/openloop-poc (080147880424)/openloop-pov-admin'
+  GCS_BUCKET: openloop-poc-demo-585077634997
+  S3_BUCKET: openloop-poc-jit-demo-080147880424
+  AWS_REGION: us-east-1
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Job 1: GCP — checkout storage-admin profile, write run-stamped file to GCS
+  # ---------------------------------------------------------------------------
+  gcp-jit-write:
+    name: GCP JIT write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install pybritive
+        run: pip install --quiet pybritive
+
+      - name: Setup gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Britive checkout (GitHub OIDC -> Britive -> GCP)
+        run: |
+          mkdir -p ~/.gcp
+          # provider format is github-<audience>; audience must match
+          # the IdP's allowedAudiences in Britive ("britive-openloop-poc")
+          pybritive checkout "$GCP_PROFILE" \
+            --federation-provider github-britive-openloop-poc \
+            --mode json > ~/.gcp/sa-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$HOME/.gcp/sa-key.json" >> $GITHUB_ENV
+
+      - name: Activate gcloud with checked-out SA key
+        run: |
+          gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"
+          gcloud config set project openloop-poc-core
+
+      - name: Write per-run file to GCS
+        run: |
+          cat > /tmp/payload.txt <<EOF
+          OpenLoop JIT demo (GCP)
+          ========================
+          run_id:        ${{ github.run_id }}
+          repo:          ${{ github.repository }}
+          ref:           ${{ github.ref }}
+          actor:         ${{ github.actor }}
+          commit:        ${{ github.sha }}
+          time:          $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          auth_path:     GitHub OIDC -> Britive (federated SI) -> GCP storage-admin
+          static_creds:  none
+          EOF
+          gcloud storage cp /tmp/payload.txt \
+            "gs://${GCS_BUCKET}/jit-demo/gcp-run-${{ github.run_id }}.txt"
+          echo "::notice::Wrote gs://${GCS_BUCKET}/jit-demo/gcp-run-${{ github.run_id }}.txt"
+
+      - name: Britive checkin
+        if: always()
+        run: pybritive checkin "$GCP_PROFILE" || true
+
+  # ---------------------------------------------------------------------------
+  # Job 2: AWS — checkout admin profile, write run-stamped file to S3
+  # (creates the bucket on first run if it doesn't exist)
+  # ---------------------------------------------------------------------------
+  aws-jit-write:
+    name: AWS JIT write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install pybritive
+        run: pip install --quiet pybritive
+
+      - name: Britive checkout (GitHub OIDC -> Britive -> AWS)
+        run: |
+          # AWS programmatic checkout returns STS creds as env vars
+          pybritive checkout "$AWS_PROFILE_PATH" \
+            --federation-provider github-britive-openloop-poc \
+            --mode env > /tmp/aws.env
+          # Export to subsequent steps via $GITHUB_ENV
+          grep -E '^(AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN)=' /tmp/aws.env >> $GITHUB_ENV
+
+      - name: Verify auth
+        run: |
+          aws sts get-caller-identity
+
+      - name: Ensure S3 bucket exists
+        run: |
+          aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null || \
+            aws s3api create-bucket --bucket "$S3_BUCKET" --region "$AWS_REGION"
+
+      - name: Write per-run file to S3
+        run: |
+          cat > /tmp/payload.txt <<EOF
+          OpenLoop JIT demo (AWS)
+          ========================
+          run_id:        ${{ github.run_id }}
+          repo:          ${{ github.repository }}
+          ref:           ${{ github.ref }}
+          actor:         ${{ github.actor }}
+          commit:        ${{ github.sha }}
+          time:          $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          auth_path:     GitHub OIDC -> Britive (federated SI) -> AWS admin
+          static_creds:  none
+          EOF
+          aws s3 cp /tmp/payload.txt "s3://${S3_BUCKET}/jit-demo/aws-run-${{ github.run_id }}.txt"
+          echo "::notice::Wrote s3://${S3_BUCKET}/jit-demo/aws-run-${{ github.run_id }}.txt"
+
+      - name: Britive checkin
+        if: always()
+        run: pybritive checkin "$AWS_PROFILE_PATH" || true
