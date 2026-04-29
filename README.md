@@ -1,53 +1,75 @@
-# OpenLoop JIT Demo — GitHub Actions OIDC → Britive → [GCP, AWS]
+# Britive JIT Demo — GitHub OIDC → Britive → AWS + GCP
 
-Demonstrates **JIT for cloud workloads** with zero static credentials in the GitHub repo.
+A reusable demo of **JIT for cloud workloads** using Britive's federated Service Identity model. The repo has zero stored credentials. Each workflow run gets short-lived AWS and GCP creds via Britive, brokered by GitHub's built-in OIDC token.
 
-## What's wired in Britive (openloop-poc tenant)
+## What this proves
 
-- **OIDC IdP**: `GitHub` (id `1`)
-  - issuer: `https://token.actions.githubusercontent.com`
-  - allowed audiences: `britive-openloop-poc`
-  - attribute map: `sub` → custom attribute `GitHub Subject` (id `dwnnahey385tip66lmgi`)
-- **Federated Service Identity**: `github-openloop-jit-demo` (userId `d6849rdvd5eyj8yb0x8h`)
-  - Bound to GitHub IdP with subject value: `repo:clintpollock/openloop-jit-demo:ref:refs/heads/main`
-  - Token duration: 600s (10 min)
-  - Member of `POC Group` tag → has policies for both GCP storage-admin and AWS admin profiles
+- Repo `Settings → Secrets and variables` is **empty**. No `AWS_*`, no `GCP_*`, no `BRITIVE_*`.
+- Each run authenticates via GitHub's per-run OIDC token (`permissions: id-token: write`)
+- Britive trusts that token (via OIDC IdP config), maps the `sub` claim to a federated Service Identity
+- That SI has Britive policies granting it specific cloud profile checkouts
+- Workflow runs `pybritive checkout`, gets short-lived creds, writes a per-run file to a bucket
+- On checkin (or run-end), Britive revokes the temporary creds
 
-## Repo setup
+## Prerequisites in your Britive tenant
 
-1. Create **public** repo `clintpollock/openloop-jit-demo` (matches the SI subject)
-2. Drop `jit-demo.yml` into `.github/workflows/`
-3. Commit + push to `main`
-4. Trigger via Actions tab → `openloop-jit-demo` → Run workflow (or any push to main)
+To reuse this against your own Britive tenant:
 
-The workflow self-creates the S3 bucket on first run, so no AWS-side prep needed.
+1. **Create an OIDC Workload Identity Provider**
+   `Identity Management → Identity Providers → Add OIDC Workload IdP`
+   - Issuer: `https://token.actions.githubusercontent.com`
+   - Allowed Audiences: a tag of your choosing (e.g. `britive-acme`) — must match `BRITIVE_FED_PROVIDER` in the workflow
+   - Attribute map: `sub` → a custom Britive identity attribute (e.g. `GitHub Subject` of type String). **Custom attribute is required; built-in `Username` does not work for federated SI mapping.**
 
-## What you'll see during the demo
+2. **Create a Federated Service Identity**
+   `Identity Management → Service Identities → Add`
+   - Bind to the OIDC IdP above
+   - External ID / federated subject: `repo:<github-org>/<github-repo>:ref:refs/heads/main`
+     (lock to a specific branch; or use any other GitHub OIDC sub claim format)
+   - Token duration: 600s (10 min) is plenty for a workflow run
 
-| Surface | What changes |
+3. **Add the SI to a tag** that has policies granting access to the AWS and/or GCP profiles you want to checkout.
+
+## Settings to swap for your tenant
+
+All in the workflow `env:` block at the top of `.github/workflows/jit-demo.yml`:
+
+| Variable | What it is |
 |---|---|
-| GitHub Actions log | Two jobs run in parallel: `gcp-jit-write`, `aws-jit-write`. Each does `pybritive checkout` with no Secret in sight |
-| Britive Audit Log | Federation auth event for SI `github-openloop-jit-demo`; checkout/checkin on each profile |
-| GCS | `gs://openloop-poc-demo-585077634997/jit-demo/gcp-run-<id>.txt` |
-| S3 | `s3://openloop-poc-jit-demo-080147880424/jit-demo/aws-run-<id>.txt` |
-| GCP IAM | Temporary shadow SA bound during run, gone after checkin |
-| AWS CloudTrail | STS AssumeRole events tied to the federated identity |
+| `BRITIVE_TENANT` | your tenant slug (the `<slug>` in `https://<slug>.britive-app.com`) |
+| `BRITIVE_FED_PROVIDER` | `github-<your-allowed-audience>` (e.g. `github-britive-acme`) — used by `pybritive --federation-provider` |
+| `AWS_PROFILE_PATH` | run `pybritive ls profiles` and copy the `Name` field of an AWS profile your SI can checkout |
+| `GCP_PROFILE` | same, for a GCP profile |
+| `S3_BUCKET` | your AWS demo bucket (workflow self-creates if missing) |
+| `GCS_BUCKET` | your GCP demo bucket (must already exist) |
 
-## Repo settings (zero secrets!)
+## Repo setup (one-time)
 
-`Settings → Secrets and variables → Actions` should be **completely empty**. No `AWS_ACCESS_KEY_ID`, no `GCP_SA_KEY`, no `BRITIVE_TOKEN`. The only requirement is workflow `permissions: id-token: write`, which is in the YAML itself.
-
-## If you change the repo name
-
-Update the SI subject:
 ```bash
-pybritive api identity_management.workload.service_identities.assign \
-  --service-identity-id d6849rdvd5eyj8yb0x8h \
-  --idp-id 1 \
-  --federated-attributes '{"GitHub Subject":"repo:YOUR-ORG/YOUR-REPO:ref:refs/heads/main"}'
+gh repo create <YOUR-ORG>/<YOUR-REPO> --public --clone
+cd <YOUR-REPO>
+mkdir -p .github/workflows
+cp /path/to/jit-demo.yml .github/workflows/
+git add . && git commit -m "Initial JIT demo" && git push
 ```
-Or via UI: `Identity Management → Service Identities → github-openloop-jit-demo → Federation`.
+
+Then trigger via Actions tab → `britive-jit-demo` → Run workflow.
+
+## What you'll see during a run
+
+| Surface | Change |
+|---|---|
+| **GitHub Actions log** | `pybritive checkout` succeeds with no Secret in sight |
+| **Britive Audit Log** | OIDC federation auth event for your federated SI; checkout/checkin events on each profile |
+| **AWS S3** | `s3://<S3_BUCKET>/jit-demo/aws-run-<id>.txt` |
+| **GCS** | `gs://<GCS_BUCKET>/jit-demo/gcp-run-<id>.txt` |
+| **AWS CloudTrail** | STS AssumeRole-with-SAML event tied to the federated identity |
+| **GCP IAM** | Temporary shadow SA bound during run, gone after checkin (when working — see Known Issues) |
+
+## Known issues
+
+**GCP-WIF profile checkout via federated SI does not currently attach roles to the shadow SA.** Britive creates the per-checkout shadow SA and returns a key, but the requested role (e.g., `roles/storage.admin`) is not bound to that SA, so writes return 403. AWS profile checkouts work because they use SAML role assumption rather than the shadow-SA model. The GCP job in this workflow has `continue-on-error: true` while this is being investigated with Britive.
 
 ## The narrative
 
-> *"This public repo has zero stored credentials. No AWS Secret, no GCP key, no Britive token. Each workflow run gets short-lived creds for both clouds — minted by Britive, delivered via GitHub's built-in OIDC token, scoped to just this repo on this branch. Nothing to leak. Nothing to rotate. The same model works for any CI/CD pipeline you have."*
+> *"This public repo has no stored credentials. Run any workflow — AWS Secret Manager and GCP Service Account keys are minted at runtime by Britive, scoped to just this repo on this branch, and revoked on checkin. Static-key rotation isn't needed because there are no static keys to rotate."*
