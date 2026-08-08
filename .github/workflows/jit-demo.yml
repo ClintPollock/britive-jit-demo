@@ -1,6 +1,6 @@
 name: britive-jit-demo
 
-# Generic JIT demo: GitHub OIDC -> Britive (federated SI) -> AWS + GCP
+# Generic JIT demo: GitHub OIDC -> Britive (federated SI) -> AWS + GCP + Azure
 # with no static credentials anywhere in this repo.
 #
 # To reuse this for your own Britive tenant, change the env vars below.
@@ -22,12 +22,18 @@ env:
   # === Profile paths (use `pybritive ls profiles` to find yours) =========
   AWS_PROFILE_PATH: 'AWS Standalone/0299-CP/CP-Admin-Profile'
   GCP_PROFILE: 'Google Cloud/Google Cloud/cpollock-pov-gcs-admin'
+  AZURE_PROFILE_PATH: 'Azure BritiveSE/Azure BritiveSE/cpollock-pov-azure-blob-writer'
   # === Demo target buckets (workflow self-creates if missing) ===========
   S3_BUCKET: britive-jit-demo-696226360299
   GCS_BUCKET: britive-jit-demo-1095450080757
+  # === Azure target (fixed infra — the JIT profile is blob-data only, so
+  #     it cannot create these; see "Azure setup" in the README) ==========
+  AZURE_STORAGE_ACCOUNT: britivejitdemo4bbb4f1c
+  AZURE_CONTAINER: jit-demo
   GCP_PROJECT_ID: cpollock-poc-core
   AWS_REGION: us-east-1
   GCP_REGION: us-central1
+  AZURE_REGION: eastus2
 
 jobs:
 
@@ -170,3 +176,175 @@ jobs:
       - name: Britive checkin
         if: always()
         run: pybritive checkin gcp-default || true
+
+  # =========================================================================
+  # Azure — checkout blob-writer profile via Britive, write per-run blob
+  #
+  # The profile grants ONLY `Storage Blob Data Contributor` at subscription
+  # scope: enough to write and read blobs, not enough to touch the control
+  # plane. The storage account itself is fixed infrastructure (created once,
+  # out of band) — so unlike the AWS/GCP jobs there is no self-create step,
+  # and the "create a resource group" attempt below is DENIED on purpose.
+  #
+  # Britive mints a fresh app registration per checkout, so the service
+  # principal client id is different on every run and nothing is long-lived.
+  # =========================================================================
+  azure-jit-write:
+    name: Azure JIT write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install pybritive
+        run: pip install --quiet pybritive
+
+      - name: Britive checkout (GitHub OIDC -> Britive -> Azure)
+        run: |
+          # Azure profiles return {TenantId, ClientId, ClientSecret} in json mode.
+          # `-m azlogin` emits a ready-made `az login` line, but it puts the secret
+          # on a command line where it can leak into logs — parse json and mask.
+          pybritive checkout "$AZURE_PROFILE_PATH" \
+            --federation-provider "$BRITIVE_FED_PROVIDER" \
+            --silent -m json > /tmp/az.json
+          python3 - <<'PY'
+          import json, os
+          d = json.load(open('/tmp/az.json'))
+          for k in ('TenantId', 'ClientId', 'ClientSecret'):
+              print(f"::add-mask::{d[k]}")
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f"AZURE_TENANT_ID={d['TenantId']}\n")
+              f.write(f"AZURE_CLIENT_ID={d['ClientId']}\n")
+              f.write(f"AZURE_CLIENT_SECRET={d['ClientSecret']}\n")
+          PY
+
+      - name: az login (retry while the new role assignment propagates)
+        run: |
+          # Britive creates a brand-new app registration + role assignment on every
+          # checkout, and ARM takes ~30-60s to recognise it. Until then az login
+          # fails with "No subscriptions found". Measured locally: OK on attempt 3
+          # (~45s). Retry rather than a fixed sleep so fast runs stay fast.
+          for i in $(seq 1 12); do
+            if az login --service-principal \
+                 --tenant "$AZURE_TENANT_ID" \
+                 --username "$AZURE_CLIENT_ID" \
+                 --password "$AZURE_CLIENT_SECRET" \
+                 --output none 2>/tmp/azerr; then
+              echo "::notice::az login succeeded on attempt $i (~$((i * 15))s of propagation)"
+              exit 0
+            fi
+            echo "attempt $i: $(head -1 /tmp/azerr)"
+            sleep 15
+          done
+          echo "::error::az login never succeeded — role assignment did not propagate"
+          exit 1
+
+      - name: Verify auth (the ephemeral service principal)
+        run: |
+          az account show --output json
+          echo "^ user.name is the JIT service principal — a DIFFERENT client id every run."
+          # NOTE: don't add `az role assignment list` here. Storage Blob Data
+          # Contributor carries no Microsoft.Authorization read, so it returns an
+          # empty table for this identity — which reads as "no grant at all" and
+          # tells the exact opposite of the story. The blob write below is the
+          # proof that the grant exists; the denied `az group create` is the
+          # proof of where it stops.
+
+      - name: Write per-run blob to Azure Storage
+        run: |
+          cat > /tmp/payload.txt <<EOF
+          Britive JIT demo (Azure)
+          ========================
+          run_id:        ${{ github.run_id }}
+          repo:          ${{ github.repository }}
+          ref:           ${{ github.ref }}
+          actor:         ${{ github.actor }}
+          commit:        ${{ github.sha }}
+          time:          $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          auth_path:     GitHub OIDC -> Britive (federated SI) -> Azure profile
+          service_princ: $(az account show --query user.name --output tsv)
+          static_creds:  none
+          EOF
+          # --auth-mode login uses the JIT service principal, NOT a storage account
+          # key. There is no account key anywhere in this workflow.
+          az storage blob upload \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --container-name "$AZURE_CONTAINER" \
+            --name "azure-run-${{ github.run_id }}.txt" \
+            --file /tmp/payload.txt \
+            --auth-mode login --overwrite --output none
+          echo "::notice::Wrote ${AZURE_STORAGE_ACCOUNT}/${AZURE_CONTAINER}/azure-run-${{ github.run_id }}.txt"
+
+      - name: Read it back
+        run: |
+          az storage blob download \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --container-name "$AZURE_CONTAINER" \
+            --name "azure-run-${{ github.run_id }}.txt" \
+            --file /tmp/readback.txt \
+            --auth-mode login --output none
+          echo "--- blob contents read back from Azure ---"
+          cat /tmp/readback.txt
+          diff -q /tmp/payload.txt /tmp/readback.txt && echo "Round-trip verified."
+
+      - name: List recent blobs (proof of past runs)
+        run: |
+          echo "Last 10 blobs in ${AZURE_STORAGE_ACCOUNT}/${AZURE_CONTAINER}/:"
+          az storage blob list \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --container-name "$AZURE_CONTAINER" \
+            --auth-mode login \
+            --query 'reverse(sort_by([].{Modified:properties.lastModified,Size:properties.contentLength,Name:name},&Modified))[:10]' \
+            --output table
+
+      - name: Prove the grant is scoped (this control-plane write MUST fail)
+        run: |
+          # The profile is blob-data only. Creating a resource group is a control
+          # plane action it has no rights to — a SUCCESS here would mean the
+          # profile is over-permissioned, so failure is the passing condition.
+          if az group create -n britive-jit-should-fail -l "$AZURE_REGION" --output none 2>/tmp/azwrite; then
+            echo "::error::Control-plane write SUCCEEDED — the profile grants more than blob data access"
+            az group delete -n britive-jit-should-fail --yes --no-wait || true
+            exit 1
+          fi
+          head -1 /tmp/azwrite
+          echo "::notice::Denied as expected — the JIT identity can write blobs and nothing else."
+
+      - name: Britive checkin
+        if: always()
+        run: |
+          # Pass the federation provider here too — the proof step below is only
+          # meaningful if this checkin actually lands, so don't swallow a failure.
+          pybritive checkin "$AZURE_PROFILE_PATH" \
+            --federation-provider "$BRITIVE_FED_PROVIDER"
+
+      - name: Proof — the JIT grant is gone after checkin
+        run: |
+          # Britive removes the role assignment on checkin. Measured locally the
+          # grant survives ~30-45s, then `az login` fails with "No subscriptions
+          # found".
+          #
+          # TWO caveats, both verified by hand — do not overclaim this on stage:
+          #  1. The SECRET may still authenticate to Entra. What is gone is the
+          #     ROLE ASSIGNMENT. Say "the grant is revoked", not "the identity
+          #     is deleted".
+          #  2. Azure does NOT invalidate access tokens that were already issued.
+          #     A token minted before checkin keeps working until it expires
+          #     (~60-90 min) even though the role assignment is gone. So this
+          #     step wipes the token cache first — otherwise `az` happily reuses
+          #     the old token and a blob write STILL SUCCEEDS after checkin.
+          #     What this proves is that a FRESH authentication gets nothing.
+          rm -rf ~/.azure
+          az logout 2>/dev/null || true
+          for i in $(seq 1 10); do
+            if ! az login --service-principal \
+                   --tenant "$AZURE_TENANT_ID" \
+                   --username "$AZURE_CLIENT_ID" \
+                   --password "$AZURE_CLIENT_SECRET" \
+                   --output none 2>/tmp/azdead; then
+              head -1 /tmp/azdead
+              echo "::notice::Grant revoked ~$((i * 15))s after checkin — a fresh login with the same client id gets nothing."
+              exit 0
+            fi
+            echo "attempt $i: grant still live, waiting for revocation..."
+            sleep 15
+          done
+          echo "::error::Credential still had access 150s after checkin"
+          exit 1
