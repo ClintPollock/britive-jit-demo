@@ -201,9 +201,28 @@ jobs:
           # Azure profiles return {TenantId, ClientId, ClientSecret} in json mode.
           # `-m azlogin` emits a ready-made `az login` line, but it puts the secret
           # on a command line where it can leak into logs — parse json and mask.
-          pybritive checkout "$AZURE_PROFILE_PATH" \
-            --federation-provider "$BRITIVE_FED_PROVIDER" \
-            --silent -m json > /tmp/az.json
+          #
+          # Azure checkouts intermittently fail with `britive.exceptions.Transaction
+          # NotFound`, most reliably on the first attempt after a profile is created
+          # or after a recent checkin. It is eventual consistency on Britive's side,
+          # not a permissions problem, and it clears on retry — so retry rather than
+          # failing the run. Note pybritive prints the exception to STDOUT, so a
+          # non-JSON payload is the real failure signal, not just the exit code.
+          for i in $(seq 1 6); do
+            pybritive checkout "$AZURE_PROFILE_PATH" \
+              --federation-provider "$BRITIVE_FED_PROVIDER" \
+              --silent -m json > /tmp/az.json 2>/tmp/azerr || true
+            if python3 -c "import json,sys; json.load(open('/tmp/az.json'))" 2>/dev/null; then
+              echo "Checkout succeeded on attempt $i"
+              break
+            fi
+            echo "attempt $i: $(head -c 120 /tmp/az.json) $(head -c 120 /tmp/azerr)"
+            if [ "$i" -eq 6 ]; then
+              echo "::error::Britive checkout never returned credentials after 6 attempts"
+              exit 1
+            fi
+            sleep 20
+          done
           python3 - <<'PY'
           import json, os
           d = json.load(open('/tmp/az.json'))
@@ -311,9 +330,18 @@ jobs:
         if: always()
         run: |
           # Pass the federation provider here too — the proof step below is only
-          # meaningful if this checkin actually lands, so don't swallow a failure.
-          pybritive checkin "$AZURE_PROFILE_PATH" \
-            --federation-provider "$BRITIVE_FED_PROVIDER"
+          # meaningful if this checkin actually lands, so don't blanket-swallow
+          # failures. The one tolerable case is "nothing was checked out", which
+          # happens when the checkout step itself failed; anything else is real.
+          if ! pybritive checkin "$AZURE_PROFILE_PATH" \
+               --federation-provider "$BRITIVE_FED_PROVIDER" > /tmp/ci.log 2>&1; then
+            cat /tmp/ci.log
+            if grep -q "no checked out profile found" /tmp/ci.log; then
+              echo "::warning::Nothing was checked out — skipping checkin."
+            else
+              exit 1
+            fi
+          fi
 
       - name: Proof — the JIT grant is gone after checkin
         run: |
