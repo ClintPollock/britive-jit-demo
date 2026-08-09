@@ -11,11 +11,14 @@ on:
   push:
     branches: [main]
   schedule:
-    # Nightly at 07:00 UTC. This is the unattended half of the demo: no human,
-    # no static credential, three clouds written by three JIT identities that
-    # exist for the length of the job. The agent/MCP half then READS what this
-    # produced - see "The nightly drop" in the README.
-    - cron: '0 7 * * *'
+    # 07:00 UTC, Monday-Friday. This is the unattended half of the demo: no
+    # human, no static credential, three clouds written by three JIT identities
+    # that exist for the length of the job. The agent/MCP half then READS what
+    # this produced - see "The nightly drop" in the README.
+    #
+    # Weekdays only, so the batch history looks like a real business pipeline
+    # and a Monday demo shows Friday's data rather than a stale weekend gap.
+    - cron: '0 7 * * 1-5'
 
 permissions:
   id-token: write
@@ -47,6 +50,10 @@ env:
   #                                      in all three clouds — see below)
   #     daily/<YYYY-MM-DD>.manifest.json per-cloud: who wrote it, which run
   DAILY_PREFIX: daily
+  # How much history each cloud keeps. Counted in BATCH DATES for daily/ (so a
+  # csv and its manifest are retained or pruned together) and in objects for the
+  # per-run marker files. See scripts/prune.py.
+  RETAIN: '10'
   GCP_PROJECT_ID: cpollock-poc-core
   AWS_REGION: us-east-1     # read implicitly by the aws CLI
   AZURE_REGION: eastus2     # used only by the deliberately-denied `az group create`
@@ -157,6 +164,31 @@ jobs:
           aws s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix jit-demo/ \
             --query 'reverse(sort_by(Contents,&LastModified))[:10].[LastModified,Size,Key]' \
             --output table
+
+      - name: Prune old files (keep the most recent $RETAIN)
+        run: |
+          # `--output text` prints the literal "None" when a prefix is empty, so
+          # filter it out rather than feeding it to the pruner as a key.
+          list () {
+            aws s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "$1" \
+              --query 'Contents[].Key' --output text 2>/dev/null \
+              | tr '\t' '\n' | grep -v '^None$' || true
+          }
+          : > /tmp/doomed.txt
+          list "${DAILY_PREFIX}/" | python3 scripts/prune.py --mode date --keep "$RETAIN" >> /tmp/doomed.txt
+          list "jit-demo/"        | python3 scripts/prune.py --mode name --keep "$RETAIN" >> /tmp/doomed.txt
+          # Two defensive details, both learned the hard way:
+          #  * `tr -d '\r'` — a stray CR riding along in a key makes `aws s3 rm`
+          #    delete a key that does not exist, which STILL EXITS 0. The prune
+          #    then no-ops in total silence.
+          #  * `</dev/null` — the CLI reads stdin, which would otherwise consume
+          #    the rest of the loop's input.
+          tr -d '\r' < /tmp/doomed.txt > /tmp/doomed.clean
+          while IFS= read -r k; do
+            [ -n "$k" ] || continue
+            aws s3 rm "s3://${S3_BUCKET}/${k}" </dev/null
+          done < /tmp/doomed.clean
+          echo "::notice::Pruned $(wc -l < /tmp/doomed.txt) object(s) from s3://${S3_BUCKET}"
 
       - name: Britive checkin
         if: always()
@@ -288,6 +320,25 @@ jobs:
         run: |
           echo "Last 10 files in gs://${GCS_BUCKET}/jit-demo/:"
           gsutil ls -l "gs://${GCS_BUCKET}/jit-demo/**" 2>/dev/null | sort -r | head -10 || true
+
+      - name: Prune old files (keep the most recent $RETAIN)
+        run: |
+          # gsutil prints full gs:// URLs; strip the bucket so the pruner and the
+          # delete loop both work in plain object keys.
+          list () {
+            gsutil ls "gs://${GCS_BUCKET}/$1**" 2>/dev/null \
+              | sed "s|gs://${GCS_BUCKET}/||" || true
+          }
+          : > /tmp/doomed.txt
+          list "${DAILY_PREFIX}/" | python3 scripts/prune.py --mode date --keep "$RETAIN" >> /tmp/doomed.txt
+          list "jit-demo/"        | python3 scripts/prune.py --mode name --keep "$RETAIN" >> /tmp/doomed.txt
+          # tr -d '\r' and </dev/null — see the note in the AWS job.
+          tr -d '\r' < /tmp/doomed.txt > /tmp/doomed.clean
+          while IFS= read -r k; do
+            [ -n "$k" ] || continue
+            gsutil rm "gs://${GCS_BUCKET}/${k}" </dev/null
+          done < /tmp/doomed.clean
+          echo "::notice::Pruned $(wc -l < /tmp/doomed.txt) object(s) from gs://${GCS_BUCKET}"
 
       - name: Britive checkin
         if: always()
@@ -515,6 +566,30 @@ jobs:
           fi
           head -1 /tmp/azwrite
           echo "::notice::Denied as expected — the JIT identity can write blobs and nothing else."
+
+      - name: Prune old blobs (keep the most recent $RETAIN)
+        run: |
+          # Must run BEFORE checkin — deleting blobs needs the JIT grant.
+          list () {
+            az storage blob list \
+              --account-name "$AZURE_STORAGE_ACCOUNT" \
+              --container-name "$AZURE_CONTAINER" \
+              --prefix "$1" --auth-mode login \
+              --query '[].name' --output tsv 2>/dev/null || true
+          }
+          : > /tmp/doomed.txt
+          list "${DAILY_PREFIX}/" | python3 scripts/prune.py --mode date --keep "$RETAIN" >> /tmp/doomed.txt
+          list "azure-run-"       | python3 scripts/prune.py --mode name --keep "$RETAIN" >> /tmp/doomed.txt
+          # tr -d '\r' and </dev/null — see the note in the AWS job.
+          tr -d '\r' < /tmp/doomed.txt > /tmp/doomed.clean
+          while IFS= read -r k; do
+            [ -n "$k" ] || continue
+            az storage blob delete \
+              --account-name "$AZURE_STORAGE_ACCOUNT" \
+              --container-name "$AZURE_CONTAINER" \
+              --name "$k" --auth-mode login --output none </dev/null
+          done < /tmp/doomed.clean
+          echo "::notice::Pruned $(wc -l < /tmp/doomed.txt) blob(s) from ${AZURE_CONTAINER}"
 
       - name: Britive checkin
         if: always()
