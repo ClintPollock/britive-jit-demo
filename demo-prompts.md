@@ -5,11 +5,12 @@ reopen, so it picks up the current config.
 
 ---
 
-### 1. *"What did the pipeline drop today, and is there any PII in it?"*
+### 1. *"What did the pipeline drop today?"*
 
-Claude reads this morning's batch and reports volume, MRR, and **records with an SSN
-sitting in a free-text `notes` field**. The numbers and the PII count change every
-weekday, so it is visibly live.
+Claude reads this morning's batch and summarises it: how many customers came in, total
+MRR, the plan and region mix, top accounts by revenue — and that the records carry
+names, emails and phone numbers. The numbers change every weekday, so it is visibly
+live rather than canned.
 
 > That file was written overnight by a GitHub Actions job — no human, no static key.
 > Claude just read it with a credential that was created for this question and destroyed

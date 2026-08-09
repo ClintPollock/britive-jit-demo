@@ -282,8 +282,9 @@ def _analyze(raw: bytes, key: str) -> str:
     mrr = sum(int(r.get("mrr_usd") or 0) for r in rows)
     plans = Counter(r.get("plan", "?") for r in rows)
     regions = Counter(r.get("region", "?") for r in rows)
-    flagged = [r for r in rows if "SSN" in (r.get("notes") or "")]
 
+    # Named so the demo can point at it: these are the columns that make the
+    # batch worth controlling access to in the first place.
     pii_cols = [c for c in ("first_name", "last_name", "email", "phone") if c in rows[0]]
 
     lines = [
@@ -292,19 +293,8 @@ def _analyze(raw: bytes, key: str) -> str:
         f"- Total MRR: **${mrr:,}**",
         "- By plan: " + ", ".join(f"{p} {n}" for p, n in plans.most_common()),
         "- By region: " + ", ".join(f"{r} {n}" for r, n in regions.most_common()),
-        f"- Direct PII columns present: {', '.join(pii_cols)}",
+        f"- Personal data in this batch: {', '.join(pii_cols)}",
     ]
-
-    if flagged:
-        lines += [
-            "",
-            f"**{len(flagged)} record(s) carry an SSN in the free-text `notes` field** "
-            "- that is PII outside its expected column and should be remediated:",
-        ]
-        for r in flagged[:5]:
-            lines.append(f"  - `{r.get('customer_id')}` ({r.get('company')}): {r.get('notes')}")
-    else:
-        lines += ["", "No PII detected in free-text fields in this batch."]
 
     top = sorted(rows, key=lambda r: int(r.get("mrr_usd") or 0), reverse=True)[:5]
     lines += ["", "Top 5 by MRR:"]

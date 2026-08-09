@@ -66,10 +66,13 @@ PLANS = {
 
 SOURCES = ["web-signup", "partner-referral", "outbound", "event", "self-serve-trial"]
 
-# Free-text notes. A few of them deliberately carry something that a
-# PII/DLP-aware agent should flag - this is what makes the agent's "I found
-# something you should look at" beat land differently on different days.
-CLEAN_NOTES = [
+# Ordinary sales notes. An earlier version salted ~8% of these with an SSN so
+# the agent could "discover" leaked PII. It was cut: the rate was implausible
+# (real leakage is orders of magnitude rarer), and more importantly it pulled
+# the demo toward data-loss discovery, which is not what any of this proves.
+# The records are already plainly sensitive - names, emails, phones, revenue
+# per account - which is all the story needs.
+NOTES = [
     "", "", "", "", "",
     "Requested SOC2 report",
     "Migrating from a competitor",
@@ -77,11 +80,6 @@ CLEAN_NOTES = [
     "Needs SSO before rollout",
     "Pilot team of 12",
     "Procurement review in progress",
-]
-FLAGGED_NOTES = [
-    "verify SSN {ssn} before billing",
-    "customer emailed SSN {ssn} - move out of free text",
-    "onboarding form captured SSN {ssn} in the wrong field",
 ]
 
 
@@ -97,13 +95,7 @@ def build_rows(rng: random.Random, batch_date: str, count: int) -> list[dict]:
         plan = rng.choices(plan_names, weights=plan_weights, k=1)[0]
         low, high = PLANS[plan][0]
 
-        # ~8% of records carry PII in a free-text field. Some days that is 0
-        # records, some days 4 - the agent reports what it actually finds.
-        if rng.random() < 0.08:
-            ssn = f"{rng.randint(100, 899)}-{rng.randint(10, 99)}-{rng.randint(1000, 9999)}"
-            note = rng.choice(FLAGGED_NOTES).format(ssn=ssn)
-        else:
-            note = rng.choice(CLEAN_NOTES)
+        note = rng.choice(NOTES)
 
         rows.append(
             {
@@ -166,13 +158,11 @@ def main(argv: list[str] | None = None) -> int:
     with open(args.out, "rb") as fh:
         digest = hashlib.sha256(fh.read()).hexdigest()
 
-    flagged = sum(1 for r in rows if "SSN" in r["notes"])
     summary = {
         "batch_date": batch_date,
         "rows": len(rows),
         "sha256": digest,
         "total_mrr_usd": sum(r["mrr_usd"] for r in rows),
-        "pii_flagged_rows": flagged,
         "by_plan": {p: sum(1 for r in rows if r["plan"] == p) for p in PLANS},
     }
 
