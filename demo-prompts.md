@@ -61,11 +61,10 @@ live rather than canned.
   against MySQL, one ephemeral DB credential per question. Currently the bridge-routed
   Docker DB, which only has `customers` (10 rows).
 - **Other clouds** → the same batch lands in GCS and Azure Blob, written by two more
-  independent JIT identities.
+  independent JIT identities. Show it in the GitHub Actions log, not in Claude — the
+  MCP server reads AWS only, for speed.
 
-**Do not ask on stage:**
-- *"Did the same batch land in all three clouds?"* — GCP and Azure return
-  `profile not found`; the AI service identity was never granted those profiles.
-- Anything touching the RDS MySQL profile — persistent `TransactionNotFound`.
+**Do not ask on stage:** anything touching the RDS MySQL profile — persistent
+`TransactionNotFound`.
 
 </details>
