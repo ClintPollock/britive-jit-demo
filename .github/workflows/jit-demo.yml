@@ -24,6 +24,16 @@ permissions:
   id-token: write
   contents: read
 
+# Serialise runs. Two overlapping runs both prune, and the second then tries to
+# delete an object the first already removed — which killed run 31325548445 with
+# `BlobNotFound` on Azure. (AWS and GCP survived only because their delete is
+# idempotent.) Overlapping runs also churn Britive checkouts against the same
+# profiles for no benefit. Queue rather than cancel: a cancelled run would leave
+# a profile checked out.
+concurrency:
+  group: jit-demo
+  cancel-in-progress: false
+
 env:
   # === Britive tenant ====================================================
   BRITIVE_TENANT: cpollock-tenant                    # <- your tenant slug
@@ -584,10 +594,20 @@ jobs:
           tr -d '\r' < /tmp/doomed.txt > /tmp/doomed.clean
           while IFS= read -r k; do
             [ -n "$k" ] || continue
-            az storage blob delete \
-              --account-name "$AZURE_STORAGE_ACCOUNT" \
-              --container-name "$AZURE_CONTAINER" \
-              --name "$k" --auth-mode login --output none </dev/null
+            # A blob that is already gone is not an error worth failing a run
+            # over — it just means something else pruned it first. Anything
+            # else still fails loudly.
+            if ! az storage blob delete \
+                 --account-name "$AZURE_STORAGE_ACCOUNT" \
+                 --container-name "$AZURE_CONTAINER" \
+                 --name "$k" --auth-mode login --output none </dev/null 2>/tmp/delerr; then
+              if grep -q 'BlobNotFound' /tmp/delerr; then
+                echo "  already gone: $k"
+              else
+                cat /tmp/delerr
+                exit 1
+              fi
+            fi
           done < /tmp/doomed.clean
           echo "::notice::Pruned $(wc -l < /tmp/doomed.txt) blob(s) from ${AZURE_CONTAINER}"
 
