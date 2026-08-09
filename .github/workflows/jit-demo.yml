@@ -29,7 +29,9 @@ env:
   # Scoped to read+write on S3_BUCKET and nothing else. Replaced
   # CP-Admin-Profile (account admin) on 2026-08-09 — see setup/least-privilege-roles.md
   AWS_PROFILE_PATH: 'AWS Standalone/0299-CP/AWS-JIT-Demo-Writer'
-  GCP_PROFILE: 'Google Cloud/Google Cloud/cpollock-pov-gcs-admin'
+  # Storage Object User + an IAM condition pinning it to GCS_BUCKET. Replaced
+  # cpollock-pov-gcs-admin (roles/storage.admin, whole project) on 2026-08-09.
+  GCP_PROFILE: 'Google Cloud/Google Cloud/GCP-JIT-Demo-Writer'
   AZURE_PROFILE_PATH: 'Azure BritiveSE/Azure BritiveSE/cpollock-pov-azure-blob-writer'
   # === Demo targets — ALL FIXED INFRA, created once, out of band =========
   #     Nothing here self-creates a bucket. That is deliberate: the JIT
@@ -193,10 +195,25 @@ jobs:
           # Unwrap to the inner SA key JSON and feed it to gcloud.
           mkdir -p ~/.gcp
           pybritive configure update profile-aliases gcp-default "$GCP_PROFILE"
-          pybritive checkout gcp-default -m json -P "$BRITIVE_FED_PROVIDER" --silent | \
-            python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); sys.stdout.write(list(d.values())[0])' \
-            > ~/.gcp/sa-key.json
-          test -s ~/.gcp/sa-key.json || { echo "::error::Empty SA key file"; exit 1; }
+          # Retry, same reason as the AWS and Azure jobs: TransactionNotFound is
+          # eventual consistency, not permissions. An empty key file is the real
+          # failure signal — pybritive prints exceptions to stdout, so a non-zero
+          # exit code is neither necessary nor sufficient.
+          for i in $(seq 1 6); do
+            pybritive checkout gcp-default -m json -P "$BRITIVE_FED_PROVIDER" --silent 2>/tmp/gcperr | \
+              python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); sys.stdout.write(list(d.values())[0])' \
+              > ~/.gcp/sa-key.json 2>/dev/null || true
+            if [ -s ~/.gcp/sa-key.json ]; then
+              echo "Checkout succeeded on attempt $i"
+              break
+            fi
+            echo "attempt $i: $(head -c 160 /tmp/gcperr)"
+            if [ "$i" -eq 6 ]; then
+              echo "::error::Britive checkout never returned a GCP SA key after 6 attempts"
+              exit 1
+            fi
+            sleep 20
+          done
           # Newly-minted SA keys take a few seconds to be usable; retry activate.
           for i in 1 2 3 4 5; do
             if gcloud auth activate-service-account --key-file=$HOME/.gcp/sa-key.json 2>&1; then
@@ -207,11 +224,23 @@ jobs:
           done
           gcloud config set project "$GCP_PROJECT_ID"
 
-      - name: Wait for IAM propagation
-        # Britive attaches roles/storage.admin at folder scope on checkout, but Google's
-        # IAM evaluation cache for newly-created SAs is slow to recognize the binding.
-        # Local test (token-based SI): ~30s. GH Actions (federated SI): seems longer.
-        run: sleep 90
+      - name: Wait for IAM propagation (poll, don't guess)
+        # Britive creates a fresh SA per checkout and binds Storage Object User
+        # (condition-scoped to GCS_BUCKET) at project scope. Google's IAM cache
+        # takes a little while to recognise the binding. Measured locally with the
+        # new condition-scoped profile: usable after ~15s. This used to be a flat
+        # `sleep 90`, which was both slower than necessary on a good day and a
+        # silent guess on a bad one — poll the actual operation instead.
+        run: |
+          for i in $(seq 1 12); do
+            if gsutil ls "gs://${GCS_BUCKET}/" >/dev/null 2>&1; then
+              echo "::notice::Binding usable after ~$((i * 15))s"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::IAM binding never became usable within 180s"
+          exit 1
 
       - name: Generate today's intake batch
         run: |

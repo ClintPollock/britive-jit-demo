@@ -150,25 +150,56 @@ same scope limitation.
 
 ---
 
-## C. GCP — verify before promising
+## C. GCP — DONE, and the best of the three
 
-Britive currently attaches `roles/storage.admin` at **folder** scope. The target is
-object read+write on one bucket:
+**Applied and verified 2026-08-09.** GCP turned out to be the one cloud where a genuine
+bucket-level scope is achievable, because **its Britive app supports permission
+constraints of type `condition`** — IAM conditions:
 
-- `roles/storage.objectUser` (create/read/delete objects), or
-- `roles/storage.objectCreator` + `roles/storage.objectViewer` for a tighter split
+```python
+constraints.list_supported_types(profile_id, permission_name="Storage Admin",
+                                 permission_type="role")   # -> ['condition']
+```
 
-**Open question that needs testing against the tenant:** GCS supports bucket-level IAM
-bindings, but whether *Britive's GCP profile model* can target a single bucket as a scope
-— rather than project / folder / org — is unconfirmed. If it cannot, the realistic
-fallback is `roles/storage.objectUser` at **project** scope on `cpollock-poc-core`, which
-is still a large improvement over `storage.admin` at folder scope: no bucket
-creation/deletion, no IAM policy changes, and blast radius limited to one project.
+(Two gotchas found the hard way: the permission name is the **display name**
+`"Storage Admin"`, not `roles/storage.admin` — passing the latter returns a bare
+`E1000 - Internal Server Error` that looks like "unsupported" but isn't. And the earlier
+claim in the workflow that Britive attached this at **folder** scope was wrong: the GCP
+environment is the **project**, `cpollock-poc-core`.)
 
-Do not claim bucket-scoped GCP on stage until this is verified.
+| | |
+|---|---|
+| Profile | `GCP-JIT-Demo-Writer`, papId `ido2oe7cpk13td8r3eho` |
+| Role | `Storage Object User` (was `Storage Admin`) |
+| Scope | Environment `cpollock-poc-core` |
+| Condition | `resource.name.startsWith("projects/_/buckets/britive-jit-demo-1095450080757")` |
+| Policies | `gcp-jit-demo-writer-github` (tag `github-jit-demo`) + `gcp-jit-demo-writer-pov-users` |
 
-A reader profile for the agent needs `roles/storage.objectViewer` at whatever scope
-turns out to be supported.
+**Why the condition is written that way.** It is tempting to add
+`resource.type == "storage.googleapis.com/Object"`. Don't — `storage.objects.list` is
+evaluated against the **bucket** resource, not an object, so an object-only condition
+silently breaks the listing step. The bare `startsWith` on the bucket path matches both
+the bucket and everything under it.
+
+**Why `Storage Object User` and not `Object Creator` + `Object Viewer`.** Overwriting an
+existing GCS object requires `storage.objects.delete` as well as `.create`. The workflow
+is idempotent by design and re-runs on the same day overwrite `daily/<date>.csv`, so a
+create-only role would break same-day re-runs. This is the one place GCP is looser than
+the AWS role, which has no delete.
+
+Verified by checkout (exit codes checked explicitly, not just output inspected):
+
+```
+ALLOW  list objects · write · read · overwrite      <- everything the workflow does
+DENY   a different bucket · list all buckets · create a bucket
+IAM propagation: usable after ~15s
+```
+
+The workflow's flat `sleep 90` was replaced with a poll on the real operation.
+
+A reader profile for the agent already exists — `cpollock-pov-gcs-viewer`
+(`Storage Object Viewer`, project scope, no condition). Add the same condition to it if
+you want the agent's GCP read bounded to this bucket too.
 
 ---
 
