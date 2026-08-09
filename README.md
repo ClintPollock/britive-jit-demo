@@ -186,13 +186,121 @@ This uses RDS (not a laptop-local DB) so others can run it. To repeat elsewhere:
 
 ---
 
+## The nightly drop — one file, three identities, no standing keys
+
+This closes the loop between the unattended pipeline and the agent that consumes it.
+
+**Every night at 07:00 UTC**, the GitHub Actions workflow generates a synthetic
+customer-intake batch and writes it to all three clouds:
+
+```
+daily/<YYYY-MM-DD>.csv             the batch
+daily/<YYYY-MM-DD>.manifest.json   who wrote it, from which run
+```
+
+**Then a human or an agent reads it back** — through PowerShell, or through Claude via
+the pipeline MCP server. Three different identities touch that one object, and **none of
+them holds a standing credential**:
+
+| # | Identity | When | How it authenticates | What it can do |
+|---|---|---|---|---|
+| 1 | GitHub Actions **federated SI** | nightly, unattended | GitHub OIDC → Britive | **write** the batch |
+| 2 | The **AI agent, as itself** | on demand | Britive service identity | **read** — accountability lands on the bot |
+| 3 | The **AI agent, as you** | on demand | same token + `X-On-Behalf-Of` | **read** — bounded by *your* access, audited to *your* name |
+
+That third row is the one worth pausing on. The agent reaches this data **because the
+human can**, not because it holds a key of its own. Revoke the human and the agent loses
+it too — no separate offboarding step, no orphaned bot credential.
+
+### Why the batch is deterministic
+
+[`scripts/gen-intake.py`](scripts/gen-intake.py) seeds its RNG from the **batch date and
+nothing else**. Consequences, all deliberate:
+
+- All three clouds hold **byte-identical** content, though three independent JIT
+  identities wrote them. `compare_clouds` diffs the sha256 — a real integrity check.
+- Re-running the workflow the same day is **idempotent** — same bytes, not a second batch.
+- The numbers still change **every day** (row count, MRR, plan mix, and how many records
+  have an SSN leaked into a free-text `notes` field). A demo is never canned, and the
+  agent's PII finding is genuinely different each morning.
+
+The manifest is the only per-cloud part — it records which JIT identity did the write.
+
+### Reading it from PowerShell
+
+Both scripts live in the parent POV folder:
+
+| Script | Reads as | Shows |
+|---|---|---|
+| `demo-ai-agent.ps1` | the agent itself | full analysis of today's batch, then the guardrails that stop the agent roaming |
+| `demo-impersonation.ps1` | the bot, then **you** | the same read under two identities, back to back |
+
+### Reading it from Claude (pipeline MCP server)
+
+```bash
+cd mcp-server-pipeline && uv sync              # add --extra gcp --extra azure for those clouds
+```
+
+Register it alongside the database server:
+
+```json
+{
+  "mcpServers": {
+    "britive-jit-pipeline": {
+      "command": "uv",
+      "args": ["--directory", "/abs/path/to/mcp-server-pipeline", "run", "python", "server.py"],
+      "env": {
+        "BRITIVE_TENANT": "cpollock-tenant",
+        "BRITIVE_API_TOKEN": "<AI service identity token>",
+        "BRITIVE_OBO_USER": "clint.pollock@jit-zsp.com"
+      }
+    }
+  }
+}
+```
+
+`BRITIVE_API_TOKEN` must be a **service identity** token — on-behalf-of impersonation
+cannot be done with a plain user token.
+
+| Tool | What it does |
+|---|---|
+| `pipeline_status` | Config only, no checkout — opens the demo, proves no standing credential |
+| `whoami` | The actual cloud identity a read runs as. Call it twice (`agent`, then `user`) for the contrast |
+| `list_batches` | Recent nightly batches — visible proof the pipeline runs |
+| `read_batch` | Reads + analyzes a batch: volume, MRR, plan mix, **PII findings** |
+| `read_manifest` | Which JIT identity wrote it, from which run |
+| `compare_clouds` | sha256 across all three clouds — three JIT identities, identical bytes |
+
+Reads default to `as_identity="user"` — the agent acts as you unless told otherwise.
+Impersonation is wired for **AWS** today; `gcp` and `azure` refuse `as_identity="user"`
+rather than silently reading as the bot.
+
+Try: *"What did the pipeline drop today, and is there any PII in it?"* then
+*"Now show me who that read actually ran as."*
+
+### Prerequisite
+
+The `AWS-S3-Reader` profile's IAM role needs `s3:ListBucket` + `s3:GetObject` on
+`britive-jit-demo-696226360299`. That role was scoped to `customer-data-intake-demo`
+only, so **this grant must be added before the read side works**. Both PowerShell
+scripts detect the missing grant and say so rather than failing obscurely.
+
+---
+
 ## Appendix — the three-cloud GitHub Actions demo
 
 A separate demo lives in [`.github/workflows/jit-demo.yml`](.github/workflows/jit-demo.yml):
 same JIT primitive, pointed at cloud storage instead of a database. GitHub Actions
 authenticates to Britive with **OIDC** (no GitHub Secrets), then checks out an AWS, a
-GCP, and an Azure profile and writes a per-run file to each. Files accumulate, so each
-job also lists the last 10 — a visible history of past runs.
+GCP, and an Azure profile and writes to each: the nightly intake batch (see
+[The nightly drop](#the-nightly-drop--one-file-three-identities-no-standing-keys) above)
+plus a per-run marker file. Files accumulate, so each job also lists the last 10 — a
+visible history of past runs.
+
+**No job creates a bucket.** All three targets are fixed infrastructure, created once out
+of band. That is deliberate: the JIT profiles are data-plane grants, and the Azure job's
+denied `az group create` is a proof step — self-creating buckets elsewhere would
+undercut it.
 
 | Cloud | Profile | Target |
 |---|---|---|
@@ -208,9 +316,9 @@ Trigger it from the Actions tab → `britive-jit-demo` → Run workflow, or by p
 |---|---|
 | **GitHub Actions log** | `pybritive checkout` succeeds with no Secret in sight |
 | **Britive Audit Log** | OIDC federation auth event for the federated SI; checkout/checkin per profile |
-| **AWS S3** | `s3://<S3_BUCKET>/jit-demo/aws-run-<id>.txt` |
-| **GCS** | `gs://<GCS_BUCKET>/jit-demo/gcp-run-<id>.txt` |
-| **Azure Blob** | `<AZURE_STORAGE_ACCOUNT>/jit-demo/azure-run-<id>.txt` |
+| **AWS S3** | `daily/<date>.csv` + `jit-demo/aws-run-<id>.txt` in `<S3_BUCKET>` |
+| **GCS** | `daily/<date>.csv` + `jit-demo/gcp-run-<id>.txt` in `<GCS_BUCKET>` |
+| **Azure Blob** | `daily/<date>.csv` + `azure-run-<id>.txt` in `<AZURE_STORAGE_ACCOUNT>` |
 | **AWS CloudTrail** | STS AssumeRole-with-SAML event tied to the federated identity |
 | **Azure** | A service principal client id that is different on every run |
 

@@ -10,6 +10,12 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+  schedule:
+    # Nightly at 07:00 UTC. This is the unattended half of the demo: no human,
+    # no static credential, three clouds written by three JIT identities that
+    # exist for the length of the job. The agent/MCP half then READS what this
+    # produced - see "The nightly drop" in the README.
+    - cron: '0 7 * * *'
 
 permissions:
   id-token: write
@@ -23,17 +29,23 @@ env:
   AWS_PROFILE_PATH: 'AWS Standalone/0299-CP/CP-Admin-Profile'
   GCP_PROFILE: 'Google Cloud/Google Cloud/cpollock-pov-gcs-admin'
   AZURE_PROFILE_PATH: 'Azure BritiveSE/Azure BritiveSE/cpollock-pov-azure-blob-writer'
-  # === Demo target buckets (workflow self-creates if missing) ===========
+  # === Demo targets — ALL FIXED INFRA, created once, out of band =========
+  #     Nothing here self-creates a bucket. That is deliberate: the JIT
+  #     profiles are data-plane grants, and the denied control-plane write in
+  #     the Azure job is a proof step. Symmetry across the three clouds keeps
+  #     that claim honest. Create these once by hand if you are forking this.
   S3_BUCKET: britive-jit-demo-696226360299
   GCS_BUCKET: britive-jit-demo-1095450080757
-  # === Azure target (fixed infra — the JIT profile is blob-data only, so
-  #     it cannot create these; see "Azure setup" in the README) ==========
   AZURE_STORAGE_ACCOUNT: britivejitdemo4bbb4f1c
   AZURE_CONTAINER: jit-demo
+  # === Where the nightly batch lands (same layout in all three clouds) ===
+  #     daily/<YYYY-MM-DD>.csv           the batch itself (identical bytes
+  #                                      in all three clouds — see below)
+  #     daily/<YYYY-MM-DD>.manifest.json per-cloud: who wrote it, which run
+  DAILY_PREFIX: daily
   GCP_PROJECT_ID: cpollock-poc-core
-  AWS_REGION: us-east-1
-  GCP_REGION: us-central1
-  AZURE_REGION: eastus2
+  AWS_REGION: us-east-1     # read implicitly by the aws CLI
+  AZURE_REGION: eastus2     # used only by the deliberately-denied `az group create`
 
 jobs:
 
@@ -44,6 +56,11 @@ jobs:
     name: AWS JIT write
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve batch date
+        run: echo "BATCH_DATE=$(date -u +%F)" >> $GITHUB_ENV
+
       - name: Install pybritive
         run: pip install --quiet pybritive
 
@@ -68,10 +85,32 @@ jobs:
       - name: Verify auth
         run: aws sts get-caller-identity
 
-      - name: Ensure S3 bucket exists
+      - name: Generate today's intake batch
         run: |
-          aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null || \
-            aws s3api create-bucket --bucket "$S3_BUCKET" --region "$AWS_REGION"
+          python3 scripts/gen-intake.py \
+            --date "$BATCH_DATE" \
+            --out /tmp/intake.csv \
+            --manifest /tmp/intake.manifest.json \
+            --cloud aws \
+            --run-id "${{ github.run_id }}" \
+            --repo "${{ github.repository }}" \
+            --actor "${{ github.actor }}" \
+            --written-by "$(aws sts get-caller-identity --query Arn --output text)"
+
+      - name: Write the batch to S3 (the thing the agent will read)
+        run: |
+          aws s3 cp /tmp/intake.csv \
+            "s3://${S3_BUCKET}/${DAILY_PREFIX}/${BATCH_DATE}.csv"
+          aws s3 cp /tmp/intake.manifest.json \
+            "s3://${S3_BUCKET}/${DAILY_PREFIX}/${BATCH_DATE}.manifest.json"
+          echo "::notice::Wrote s3://${S3_BUCKET}/${DAILY_PREFIX}/${BATCH_DATE}.csv"
+
+      - name: List recent batches (proof the pipeline runs nightly)
+        run: |
+          echo "Last 10 batches in s3://${S3_BUCKET}/${DAILY_PREFIX}/:"
+          aws s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "${DAILY_PREFIX}/" \
+            --query 'reverse(sort_by(Contents,&LastModified))[:10].[LastModified,Size,Key]' \
+            --output table
 
       - name: Write per-run file to S3
         run: |
@@ -102,17 +141,26 @@ jobs:
         run: pybritive checkin "$AWS_PROFILE_PATH" || true
 
   # =========================================================================
-  # GCP — checkout storage profile via Britive, write per-run file to GCS
-  # KNOWN ISSUE: Britive's federated-SI programmatic checkout for GCP-WIF
-  # profiles does not currently attach the requested role to the shadow SA.
-  # The shadow SA is created and a key is returned, but role binding is
-  # missing -> writes return 403 storage.objects.get denied.
-  # AWS path works because it uses SAML role assumption (different code path).
+  # GCP — checkout storage profile via Britive, write the batch to GCS
+  #
+  # HISTORY (so nobody re-diagnoses this): this job failed for months with
+  # 403s that looked like a Britive shadow-SA role-binding bug. It was not.
+  # The real cause was that project cpollock-poc-core was linked to a CLOSED
+  # billing account, so Google refused the write at the billing layer:
+  #   AccessDeniedException: 403 The billing account for the owning project
+  #   is disabled in state closed
+  # Relinked to an open billing account 2026-08-08 and verified with a real
+  # write+delete. The Britive checkout path was working the whole time.
   # =========================================================================
   gcp-jit-write:
     name: GCP JIT write
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve batch date
+        run: echo "BATCH_DATE=$(date -u +%F)" >> $GITHUB_ENV
+
       - name: Install pybritive
         run: pip install --quiet pybritive
 
@@ -145,11 +193,30 @@ jobs:
         # Local test (token-based SI): ~30s. GH Actions (federated SI): seems longer.
         run: sleep 90
 
-      - name: Ensure GCS bucket exists
+      - name: Generate today's intake batch
         run: |
-          if ! gsutil ls -b "gs://${GCS_BUCKET}" 2>/dev/null; then
-            gsutil mb -l "$GCP_REGION" -b on "gs://${GCS_BUCKET}"
-          fi
+          python3 scripts/gen-intake.py \
+            --date "$BATCH_DATE" \
+            --out /tmp/intake.csv \
+            --manifest /tmp/intake.manifest.json \
+            --cloud gcp \
+            --run-id "${{ github.run_id }}" \
+            --repo "${{ github.repository }}" \
+            --actor "${{ github.actor }}" \
+            --written-by "$(gcloud config get-value account 2>/dev/null)"
+
+      - name: Write the batch to GCS (the thing the agent will read)
+        run: |
+          gsutil cp /tmp/intake.csv \
+            "gs://${GCS_BUCKET}/${DAILY_PREFIX}/${BATCH_DATE}.csv"
+          gsutil cp /tmp/intake.manifest.json \
+            "gs://${GCS_BUCKET}/${DAILY_PREFIX}/${BATCH_DATE}.manifest.json"
+          echo "::notice::Wrote gs://${GCS_BUCKET}/${DAILY_PREFIX}/${BATCH_DATE}.csv"
+
+      - name: List recent batches (proof the pipeline runs nightly)
+        run: |
+          echo "Last 10 batches in gs://${GCS_BUCKET}/${DAILY_PREFIX}/:"
+          gsutil ls -l "gs://${GCS_BUCKET}/${DAILY_PREFIX}/**" 2>/dev/null | sort -r | head -10 || true
 
       - name: Write per-run file to GCS
         run: |
@@ -193,6 +260,11 @@ jobs:
     name: Azure JIT write
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve batch date
+        run: echo "BATCH_DATE=$(date -u +%F)" >> $GITHUB_ENV
+
       - name: Install pybritive
         run: pip install --quiet pybritive
 
@@ -265,6 +337,46 @@ jobs:
           # tells the exact opposite of the story. The blob write below is the
           # proof that the grant exists; the denied `az group create` is the
           # proof of where it stops.
+
+      - name: Generate today's intake batch
+        run: |
+          python3 scripts/gen-intake.py \
+            --date "$BATCH_DATE" \
+            --out /tmp/intake.csv \
+            --manifest /tmp/intake.manifest.json \
+            --cloud azure \
+            --run-id "${{ github.run_id }}" \
+            --repo "${{ github.repository }}" \
+            --actor "${{ github.actor }}" \
+            --written-by "$(az account show --query user.name --output tsv)"
+
+      - name: Write the batch to Azure Storage (the thing the agent will read)
+        run: |
+          # --auth-mode login uses the JIT service principal, not an account key.
+          az storage blob upload \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --container-name "$AZURE_CONTAINER" \
+            --name "${DAILY_PREFIX}/${BATCH_DATE}.csv" \
+            --file /tmp/intake.csv \
+            --auth-mode login --overwrite --output none
+          az storage blob upload \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --container-name "$AZURE_CONTAINER" \
+            --name "${DAILY_PREFIX}/${BATCH_DATE}.manifest.json" \
+            --file /tmp/intake.manifest.json \
+            --auth-mode login --overwrite --output none
+          echo "::notice::Wrote ${AZURE_CONTAINER}/${DAILY_PREFIX}/${BATCH_DATE}.csv"
+
+      - name: List recent batches (proof the pipeline runs nightly)
+        run: |
+          echo "Last 10 batches in ${AZURE_STORAGE_ACCOUNT}/${AZURE_CONTAINER}/${DAILY_PREFIX}/:"
+          az storage blob list \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --container-name "$AZURE_CONTAINER" \
+            --prefix "${DAILY_PREFIX}/" \
+            --auth-mode login \
+            --query 'reverse(sort_by([].{Modified:properties.lastModified,Size:properties.contentLength,Name:name},&Modified))[:10]' \
+            --output table
 
       - name: Write per-run blob to Azure Storage
         run: |

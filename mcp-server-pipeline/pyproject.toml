@@ -1,0 +1,19 @@
+[project]
+name = "britive-jit-pipeline-mcp"
+version = "0.1.0"
+description = "MCP server: Claude reads the nightly multi-cloud JIT batch, as itself or on behalf of a human."
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0",
+    "britive>=2.20.0",
+    "boto3>=1.34.0",
+]
+
+[project.optional-dependencies]
+# AWS is the impersonation path and works with the base install. GCP and
+# Azure reads are opt-in so the server starts fine without their SDKs.
+gcp = ["google-cloud-storage>=2.14.0"]
+azure = ["azure-identity>=1.15.0", "azure-storage-blob>=12.19.0"]
+
+[tool.uv]
+package = false
