@@ -175,7 +175,7 @@ jobs:
             --query 'reverse(sort_by(Contents,&LastModified))[:10].[LastModified,Size,Key]' \
             --output table
 
-      - name: Prune old files (keep the most recent $RETAIN)
+      - name: Prune old files (keep the most recent ${{ env.RETAIN }})
         run: |
           # `--output text` prints the literal "None" when a prefix is empty, so
           # filter it out rather than feeding it to the pruner as a key.
@@ -331,7 +331,7 @@ jobs:
           echo "Last 10 files in gs://${GCS_BUCKET}/jit-demo/:"
           gsutil ls -l "gs://${GCS_BUCKET}/jit-demo/**" 2>/dev/null | sort -r | head -10 || true
 
-      - name: Prune old files (keep the most recent $RETAIN)
+      - name: Prune old files (keep the most recent ${{ env.RETAIN }})
         run: |
           # gsutil prints full gs:// URLs; strip the bucket so the pruner and the
           # delete loop both work in plain object keys.
@@ -407,21 +407,25 @@ jobs:
             pybritive checkout "$AZURE_PROFILE_PATH" \
               --federation-provider "$BRITIVE_FED_PROVIDER" \
               --silent -m json > /tmp/az.json 2>/tmp/azerr || true
-            if python3 - <<'PY' 2>/dev/null
+            # Capture python's exit code DIRECTLY. Do not wrap this in `if ...;
+            # then ... fi` and read $? afterwards: when an if-condition fails and
+            # there is no else, the if-statement itself exits 0, so $? is 0 and
+            # the rc==2 branch below becomes unreachable dead code. That is
+            # exactly what the first version of this did.
+            python3 - <<'PY' 2>/dev/null
           import json, sys
           try:
               d = json.load(open('/tmp/az.json'))
           except Exception:
-              sys.exit(1)
+              sys.exit(1)          # not JSON at all
           sys.exit(0 if all(str(d.get(k, '')).strip() for k in ('TenantId', 'ClientId', 'ClientSecret')) else 2)
           PY
-            then
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
               echo "Checkout succeeded on attempt $i"
               ok=1
               break
-            fi
-            rc=$?
-            if [ "$rc" -eq 2 ]; then
+            elif [ "$rc" -eq 2 ]; then
               echo "attempt $i: payload parsed but a credential field was empty — checking in to force a fresh app registration"
               pybritive checkin "$AZURE_PROFILE_PATH" \
                 --federation-provider "$BRITIVE_FED_PROVIDER" >/dev/null 2>&1 || true
@@ -577,7 +581,7 @@ jobs:
           head -1 /tmp/azwrite
           echo "::notice::Denied as expected — the JIT identity can write blobs and nothing else."
 
-      - name: Prune old blobs (keep the most recent $RETAIN)
+      - name: Prune old blobs (keep the most recent ${{ env.RETAIN }})
         run: |
           # Must run BEFORE checkin — deleting blobs needs the JIT grant.
           list () {

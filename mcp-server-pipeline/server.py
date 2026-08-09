@@ -360,10 +360,13 @@ def whoami(as_identity: str = "user", cloud: str = "aws") -> str:
     the same Britive service identity produce two different cloud sessions:
     the bot, and the human it is acting for.
     """
+    # Check this BEFORE the checkout — otherwise we mint and immediately discard
+    # a real credential just to print a "not supported" message, which also puts
+    # a pointless pair of rows in the Britive audit log.
+    if cloud != "aws":
+        return f"`whoami` is AWS-only right now (asked for {cloud})."
     try:
         with jit_credentials(cloud, as_identity) as creds:
-            if cloud != "aws":
-                return f"`whoami` is AWS-only right now (asked for {cloud})."
             ident = _aws_client(creds, "sts").get_caller_identity()
         return (
             f"**as_identity='{as_identity}'** -> {_identity_label(as_identity)}\n\n"
