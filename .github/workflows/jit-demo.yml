@@ -300,21 +300,50 @@ jobs:
           # not a permissions problem, and it clears on retry — so retry rather than
           # failing the run. Note pybritive prints the exception to STDOUT, so a
           # non-JSON payload is the real failure signal, not just the exit code.
+          # VALIDATE THE FIELDS, NOT JUST THAT IT IS JSON. Run 31315282353 failed
+          # with `az login: argument --password: expected one argument` — i.e. an
+          # EMPTY ClientSecret — after a checkout that this loop had declared
+          # successful because the payload happened to parse.
+          #
+          # Mechanism: Britive mints a new app registration per checkout and only
+          # returns the secret when it creates one. Attempts 1-3 threw
+          # TransactionNotFound to the client while (apparently) leaving a
+          # transaction server-side, so attempt 4 returned that existing
+          # transaction with no secret in it. So on a credential-less payload,
+          # check in first — that frees the transaction and lets the next attempt
+          # mint a fresh registration WITH a secret.
+          ok=0
           for i in $(seq 1 6); do
             pybritive checkout "$AZURE_PROFILE_PATH" \
               --federation-provider "$BRITIVE_FED_PROVIDER" \
               --silent -m json > /tmp/az.json 2>/tmp/azerr || true
-            if python3 -c "import json,sys; json.load(open('/tmp/az.json'))" 2>/dev/null; then
+            if python3 - <<'PY' 2>/dev/null
+          import json, sys
+          try:
+              d = json.load(open('/tmp/az.json'))
+          except Exception:
+              sys.exit(1)
+          sys.exit(0 if all(str(d.get(k, '')).strip() for k in ('TenantId', 'ClientId', 'ClientSecret')) else 2)
+          PY
+            then
               echo "Checkout succeeded on attempt $i"
+              ok=1
               break
             fi
-            echo "attempt $i: $(head -c 120 /tmp/az.json) $(head -c 120 /tmp/azerr)"
-            if [ "$i" -eq 6 ]; then
-              echo "::error::Britive checkout never returned credentials after 6 attempts"
-              exit 1
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "attempt $i: payload parsed but a credential field was empty — checking in to force a fresh app registration"
+              pybritive checkin "$AZURE_PROFILE_PATH" \
+                --federation-provider "$BRITIVE_FED_PROVIDER" >/dev/null 2>&1 || true
+            else
+              echo "attempt $i: $(head -c 120 /tmp/az.json) $(head -c 120 /tmp/azerr)"
             fi
             sleep 20
           done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::Britive checkout never returned a complete credential after 6 attempts"
+            exit 1
+          fi
           python3 - <<'PY'
           import json, os
           d = json.load(open('/tmp/az.json'))
