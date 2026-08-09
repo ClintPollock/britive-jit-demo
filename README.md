@@ -220,9 +220,9 @@ nothing else**. Consequences, all deliberate:
 - All three clouds hold **byte-identical** content, though three independent JIT
   identities wrote them. `compare_clouds` diffs the sha256 — a real integrity check.
 - Re-running the workflow the same day is **idempotent** — same bytes, not a second batch.
-- The numbers still change **every day** (row count, MRR, plan mix, and how many records
-  have an SSN leaked into a free-text `notes` field). A demo is never canned, and the
-  agent's PII finding is genuinely different each morning.
+- The numbers still change **every day** — row count, MRR, plan mix, region spread, top
+  accounts. A demo is never canned; the agent's summary is genuinely different each
+  morning.
 
 The manifest is the only per-cloud part — it records which JIT identity did the write.
 
