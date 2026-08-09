@@ -26,7 +26,9 @@ env:
   BRITIVE_TENANT: cpollock-tenant                    # <- your tenant slug
   BRITIVE_FED_PROVIDER: github-britive-cpollock      # <- "github-<allowed-audience>" (matches your Britive OIDC IdP)
   # === Profile paths (use `pybritive ls profiles` to find yours) =========
-  AWS_PROFILE_PATH: 'AWS Standalone/0299-CP/CP-Admin-Profile'
+  # Scoped to read+write on S3_BUCKET and nothing else. Replaced
+  # CP-Admin-Profile (account admin) on 2026-08-09 — see setup/least-privilege-roles.md
+  AWS_PROFILE_PATH: 'AWS Standalone/0299-CP/AWS-JIT-Demo-Writer'
   GCP_PROFILE: 'Google Cloud/Google Cloud/cpollock-pov-gcs-admin'
   AZURE_PROFILE_PATH: 'Azure BritiveSE/Azure BritiveSE/cpollock-pov-azure-blob-writer'
   # === Demo targets — ALL FIXED INFRA, created once, out of band =========
@@ -68,10 +70,28 @@ jobs:
         run: |
           # env-nix emits `export AWS_*="value"` lines (plus a KUBECONFIG warning).
           # Filter to only AWS_* exports, then source.
-          pybritive checkout "$AWS_PROFILE_PATH" \
-            --federation-provider "$BRITIVE_FED_PROVIDER" \
-            --silent --mode env-nix \
-            | grep -E '^export AWS_' > /tmp/aws.env
+          #
+          # Retry for the same reason the Azure job does: Britive throws
+          # `TransactionNotFound` on freshly created profiles and shortly after a
+          # checkin. It is eventual consistency, not permissions. An empty
+          # /tmp/aws.env is the real failure signal — pybritive prints the
+          # exception to stdout, so the exit code alone is not enough.
+          for i in $(seq 1 6); do
+            pybritive checkout "$AWS_PROFILE_PATH" \
+              --federation-provider "$BRITIVE_FED_PROVIDER" \
+              --silent --mode env-nix 2>/tmp/awserr \
+              | grep -E '^export AWS_' > /tmp/aws.env || true
+            if [ -s /tmp/aws.env ]; then
+              echo "Checkout succeeded on attempt $i"
+              break
+            fi
+            echo "attempt $i: $(head -c 160 /tmp/awserr)"
+            if [ "$i" -eq 6 ]; then
+              echo "::error::Britive checkout never returned AWS credentials after 6 attempts"
+              exit 1
+            fi
+            sleep 20
+          done
           set -a; source /tmp/aws.env; set +a
           echo "::add-mask::$AWS_ACCESS_KEY_ID"
           echo "::add-mask::$AWS_SECRET_ACCESS_KEY"

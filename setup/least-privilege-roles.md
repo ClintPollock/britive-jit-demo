@@ -8,12 +8,19 @@
 > | ✅ Inline policy `jit-demo-bucket-rw` | `s3:ListBucket` on the bucket, `s3:GetObject`+`s3:PutObject` on `/*`. No delete, no control plane. |
 > | ✅ Inline policy `jit-demo-bucket-ro` | added to `cpollock-britive-s3-readonly-role` — `ListBucket` + `GetObject` only |
 >
-> **The read side is now unblocked and needs no Britive change** — the grant lives on the
-> IAM role that `AWS-S3-Reader` already assumes, so the MCP server and both PowerShell
-> demos should work immediately.
+> **Read side — verified working.** MCP server (`whoami` in both identity modes,
+> `list_batches`, `read_batch`, `read_manifest`) and both PowerShell demos all run green
+> against the live batch.
 >
-> **The write side is NOT live yet.** The workflow still runs on `CP-Admin-Profile` until
-> steps A4.1–A4.4 below are done in the Britive tenant.
+> **Write side — Britive profile built and verified 2026-08-09:**
+>
+> | Done | Detail |
+> |---|---|
+> | ✅ AWS app rescanned | task `o9otra3173whm0fsgbxeor50`, discovered `britive-jit-demo-rw` as Registered |
+> | ✅ Profile `AWS-JIT-Demo-Writer` | papId `1gp1xow8llz0and0i9nm`, scope Environment `0299-CP`, permission `britive-jit-demo-rw` |
+> | ✅ Policies | `jit-demo-writer-github` (tag `github-jit-demo`) + `jit-demo-writer-pov-users` (so it can be checked out by hand) |
+> | ✅ Verified by checkout | identity `assumed-role/britive-jit-demo-rw/…`; write OK, read OK; **denied**: other bucket, list-all-buckets, create-bucket, delete-object |
+> | ✅ Workflow repointed | `AWS_PROFILE_PATH` → `AWS Standalone/0299-CP/AWS-JIT-Demo-Writer`, plus a 6× checkout retry on the AWS job |
 >
 > Note the trust policy carries `sts:SetSourceIdentity` — that is what makes the
 > impersonation demo's CloudTrail `sourceIdentity` work, and the new role inherits it.
@@ -105,25 +112,41 @@ minutes. That is eventual consistency, not permissions — the workflow already 
 
 ---
 
-## B. Azure — the easy one
+## B. Azure — NOT POSSIBLE as originally planned
 
-The role is already correct (`Storage Blob Data Contributor`); only the **scope** is
-wrong. Re-point the profile's assignment from the subscription to the storage account:
+**Corrected 2026-08-09.** An earlier version of this document said Azure was "the easy
+one — just repoint the profile's scope at the storage account." That is wrong. Verified
+against the live tenant:
 
 ```
-/subscriptions/4bbb4f1c-8734-4a04-a295-487d52fa4e7f
-  /resourceGroups/britive-jit-demo-rg
-  /providers/Microsoft.Storage/storageAccounts/britivejitdemo4bbb4f1c
+profile scope:  [{"type": "Environment", "value": "4bbb4f1c-8734-4a04-a295-487d52fa4e7f"}]
+constraints:    400 - E1003 - App does not support profile permission constraints
+                (appContainerId=29)
 ```
 
-Container-level scope (`.../blobServices/default/containers/jit-demo`) is also possible
-and tighter still. Storage-account scope is the safer default — it leaves room for a
-second container without another Britive change.
+For Azure, **Britive's "environment" IS the subscription**, and the role assignment is
+made at environment scope. There is no per-permission constraint mechanism on this app to
+narrow it to a storage account or container. (The AWS app returns the same
+`E1003` — constraints are not enabled there either. AWS was fixable only because the
+scope lives in the *IAM policy*, which is a different lever.)
 
-Nothing in the workflow changes. The denied `az group create` proof step keeps working;
-in fact it gets stronger, because the grant no longer spans the subscription at all.
+Realistic options:
 
-A reader profile for the agent needs **Storage Blob Data Reader** at the same scope.
+1. **Accept it, and say so precisely on stage.** `Azure subscription 1` contains almost
+   nothing — `NetworkWatcherRG` plus the demo storage account — so Blob Data Contributor
+   at subscription scope has a small *actual* blast radius, and the denied
+   `az group create` still proves it cannot touch the control plane. **Recommended.**
+2. **A custom Azure role** with `dataActions` limited to blob read/write, still assigned
+   at subscription scope. Narrows *what*, not *where*. Watch out: setting the custom
+   role's `assignableScopes` to just the storage account makes Britive's
+   subscription-scope assignment **fail**.
+
+Do not claim "scoped to the storage account" for Azure. The honest line is: *"on Azure
+the JIT grant is bounded to blob data operations; the scope is the subscription because
+that is the boundary this integration assigns at."*
+
+A reader profile for the agent would use **Storage Blob Data Reader**, subject to the
+same scope limitation.
 
 ---
 
