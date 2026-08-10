@@ -347,9 +347,13 @@ Then swap the workflow `env:` block:
 | `BRITIVE_TENANT` | your tenant slug (the `<slug>` in `https://<slug>.britive-app.com`) |
 | `BRITIVE_FED_PROVIDER` | `github-<your-allowed-audience>` |
 | `AWS_PROFILE_PATH` / `GCP_PROFILE` / `AZURE_PROFILE_PATH` | run `pybritive ls profiles` and copy the `Name` field |
-| `S3_BUCKET` | AWS demo bucket (workflow self-creates if missing) |
-| `GCS_BUCKET` | GCP demo bucket (must already exist) |
+| `S3_BUCKET` / `GCS_BUCKET` | AWS and GCP demo buckets — **must already exist**, nothing self-creates |
 | `AZURE_STORAGE_ACCOUNT` / `AZURE_CONTAINER` | Azure target (must already exist — see below) |
+| `RETAIN` | how many batch dates / run markers each cloud keeps (default 10) |
+
+All three targets are fixed infrastructure on purpose: the JIT profiles are data-plane
+grants, and the Azure job's deliberately-denied `az group create` is a proof step that
+self-creating buckets elsewhere would undercut.
 
 ### Azure setup (already done — recorded here so it can be rebuilt)
 
