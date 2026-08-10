@@ -52,6 +52,7 @@ import os
 from collections import Counter
 from datetime import datetime, timezone, date as _date
 
+import boto3
 from britive.britive import Britive
 from mcp.server.fastmcp import FastMCP
 
@@ -63,14 +64,52 @@ TOKEN = os.environ.get("BRITIVE_API_TOKEN", "")
 OBO_USER = os.environ.get("BRITIVE_OBO_USER", "clint.pollock@jit-zsp.com")
 
 DAILY_PREFIX = os.environ.get("PIPELINE_DAILY_PREFIX", "daily")
-PROFILE = os.environ.get("PIPELINE_AWS_PROFILE", "AWS Standalone/0299-CP/AWS-S3-Reader")
 BUCKET = os.environ.get("PIPELINE_S3_BUCKET", "britive-jit-demo-696226360299")
+
+# One profile per identity mode, because of a measured Britive behaviour:
+# checking the SAME profile out again as the SAME identity shortly after a
+# checkin blocks while the previous grant is torn down. Measured on this tenant:
+#
+#     cold, as the human ................  3.9s
+#     immediately again, same identity ... 39.7s
+#     immediately, different identity ....  3.5s
+#     same identity after a 30s settle ... 25.5s
+#
+# Two consecutive reads as the human - which is exactly what the demo does when
+# you ask a question and then ask who it ran as - therefore hit the slow path.
+# Point PIPELINE_AWS_AGENT_PROFILE at a SECOND reader profile and the two modes
+# stop colliding. Left unset it falls back to the same profile, which still
+# works; it is just slower back to back.
+PROFILE = os.environ.get("PIPELINE_AWS_PROFILE", "AWS Standalone/0299-CP/AWS-S3-Reader")
+AGENT_PROFILE = os.environ.get("PIPELINE_AWS_AGENT_PROFILE", PROFILE)
+
+
+def _profile_for(as_identity: str) -> str:
+    return AGENT_PROFILE if as_identity == "agent" else PROFILE
 
 mcp = FastMCP("britive-jit-pipeline")
 
 
 class PipelineError(RuntimeError):
     pass
+
+
+# ── Warm caches (latency, not behaviour) ────────────────────────────────────
+# Profiling one read: checkout 3.9s, checkin 0.8s, S3 0.8s, and ~0.65s of pure
+# client construction that we were paying on EVERY call — a fresh Britive()
+# each time (~0.32s warm) plus a fresh boto3 client (~0.33s, mostly loading the
+# S3 service model). Both are reusable. Note this caches CLIENTS, never
+# credentials: every tool call still does its own checkout and checkin, which
+# is the whole point of the demo.
+_BRITIVE: Britive | None = None
+_SESSION = boto3.session.Session()
+
+
+def _britive(fresh: bool = False) -> Britive:
+    global _BRITIVE
+    if fresh or _BRITIVE is None:
+        _BRITIVE = Britive(tenant=TENANT, token=TOKEN)
+    return _BRITIVE
 
 
 # ── Britive checkout / checkin ──────────────────────────────────────────────
@@ -99,24 +138,34 @@ def jit_credentials(as_identity: str):
             "plain user token."
         )
 
-    app, env, profile = _split_profile(PROFILE)
+    profile_path = _profile_for(as_identity)
+    app, env, profile = _split_profile(profile_path)
     headers = {"X-On-Behalf-Of": OBO_USER} if as_identity == "user" else {}
-    br = Britive(tenant=TENANT, token=TOKEN)
 
-    try:
-        result = br.my_access.checkout_by_name(
+    def _checkout(br: Britive):
+        return br.my_access.checkout_by_name(
             profile_name=profile,
             environment_name=env,
             application_name=app,
             headers=headers,
             include_credentials=True,
         )
-    except Exception as exc:  # noqa: BLE001 - surface Britive's message verbatim
-        raise PipelineError(
-            f"Britive checkout of '{PROFILE}' as "
-            f"{'the human ' + OBO_USER if as_identity == 'user' else 'the agent'} "
-            f"failed: {exc}"
-        ) from exc
+
+    br = _britive()
+    try:
+        result = _checkout(br)
+    except Exception:  # noqa: BLE001
+        # The cached client may have gone stale between demos. Rebuild once
+        # before giving up — cheap insurance against a dead session on stage.
+        try:
+            br = _britive(fresh=True)
+            result = _checkout(br)
+        except Exception as exc:  # noqa: BLE001 - surface Britive's message verbatim
+            raise PipelineError(
+                f"Britive checkout of '{profile_path}' as "
+                f"{'the human ' + OBO_USER if as_identity == 'user' else 'the agent'} "
+                f"failed: {exc}"
+            ) from exc
 
     try:
         yield result.get("credentials", result)
@@ -142,9 +191,9 @@ def _identity_label(as_identity: str) -> str:
 
 
 def _client(creds: dict, service: str = "s3"):
-    import boto3
-
-    return boto3.client(
+    # Reuse the module-level Session so the service model is loaded once, not
+    # per call. The credentials are still per-checkout and never cached.
+    return _SESSION.client(
         service,
         aws_access_key_id=creds["accessKeyID"],
         aws_secret_access_key=creds["secretAccessKey"],
@@ -198,11 +247,18 @@ def _analyze(raw: bytes, key: str) -> str:
     return "\n".join(lines)
 
 
-def _footer(as_identity: str) -> str:
+def _footer(as_identity: str, arn: str | None = None) -> str:
+    # Reporting the ARN here is a latency fix as much as a clarity one. Asking
+    # "who did that read run as?" used to trigger a second whoami, and a second
+    # checkout of the SAME profile as the SAME identity right after a checkin is
+    # the pathological case — measured at 25-49s against ~4s cold. Attaching the
+    # identity to the read that actually used it costs one extra STS call on a
+    # credential already in hand (~0.3s) and removes that checkout entirely.
+    ident = f"\n_Ran as:_ `{arn}`" if arn else ""
     return (
         f"\n\n---\n_Read as {_identity_label(as_identity)}, using a Britive credential "
         f"that was checked out for this call and checked back in before this text was "
-        f"returned. No standing cloud credential exists._"
+        f"returned. No standing cloud credential exists._{ident}"
     )
 
 
@@ -219,7 +275,10 @@ def pipeline_status() -> str:
         "**Nightly JIT pipeline - configuration**",
         "",
         f"Britive tenant: `{TENANT}`",
-        f"Reader profile: `{PROFILE}`",
+        f"Reader profile (as you):    `{PROFILE}`",
+        f"Reader profile (as agent):  `{AGENT_PROFILE}`"
+        + ("  — same profile; set PIPELINE_AWS_AGENT_PROFILE to a second one "
+           "if back-to-back calls feel slow" if AGENT_PROFILE == PROFILE else ""),
         f"Bucket:         `s3://{BUCKET}`",
         f"Batch layout:   `{DAILY_PREFIX}/<YYYY-MM-DD>.csv` (+ `.manifest.json`)",
         f"Impersonates:   `{OBO_USER}` when a tool is called with as_identity='user'",
@@ -313,7 +372,13 @@ def read_batch(batch_date: str = "today", as_identity: str = "user") -> str:
         key = f"{DAILY_PREFIX}/{_resolve_date(batch_date)}.csv"
         with jit_credentials(as_identity) as creds:
             raw = _client(creds).get_object(Bucket=BUCKET, Key=key)["Body"].read()
-        return _analyze(raw, key) + _footer(as_identity)
+            # Same credential, one extra call — so "who did that run as?" needs
+            # no second checkout. See the note in _footer().
+            try:
+                arn = _client(creds, "sts").get_caller_identity()["Arn"]
+            except Exception:  # noqa: BLE001 - never fail a read over this
+                arn = None
+        return _analyze(raw, key) + _footer(as_identity, arn)
     except PipelineError as exc:
         return f"Error: {exc}"
     except Exception as exc:  # noqa: BLE001

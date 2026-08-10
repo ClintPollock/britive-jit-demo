@@ -20,6 +20,9 @@ live rather than canned.
 
 ### 2. *"Who did that read actually run as?"*
 
+Answered straight from the previous reply — the read reports the identity it used, so
+this costs no tool call and returns instantly.
+
 ```
 …assumed-role/cpollock-britive-s3-readonly-role/clint.pollock@jit-zsp.com
 ```
