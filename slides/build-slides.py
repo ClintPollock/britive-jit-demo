@@ -105,26 +105,37 @@ def slide_one(prs):
     para(tf, "Nightly pipeline writes it. You ask Claude about it. Nothing holds a key in between.",
          size=13.5, color=MUTED)
 
-    y = 1.55
-    node(s, 0.7, y, 3.5, 1.5, "GitHub Actions",
-         ["Machine identity, 07:00 daily", "OIDC → Britive → JIT credential",
-          "No secrets in the repo"])
-    arrow(s, 4.35, y + 0.64, 0.75)
-    node(s, 5.25, y, 3.0, 1.5, "s3://…/daily/",
+    y = 1.45
+    node(s, 0.7, y, 3.5, 1.45, "GitHub Actions",
+         ["Machine identity, 07:00 Mon–Fri", "OIDC → Britive → JIT credential",
+          "Nothing stored in the repo"])
+    arrow(s, 4.35, y + 0.61, 0.75)
+    node(s, 5.25, y, 3.0, 1.45, "s3://…/daily/",
          ["Today's customer intake batch", "43 records · $29,322 MRR",
           "Written by an identity that", "no longer exists"], tint=WHITE)
-    arrow(s, 8.45, y + 0.64, 0.75)
-    node(s, 9.55, y, 3.1, 1.5, "Claude Desktop",
+    arrow(s, 8.45, y + 0.61, 0.75)
+    node(s, 9.55, y, 3.1, 1.45, "Claude Desktop",
          ["Reads it on demand via MCP", "Credential minted per question,",
           "revoked before it answers"])
 
-    tf = textbox(s, 0.7, 3.30, 12.0, 0.3)
+    # The whole "there is no secret" claim, made concrete. This subject string
+    # is bound to a Britive federated service identity; change the repo, the
+    # owner or the branch and it stops matching. There is nothing else to steal.
+    box(s, 0.7, 3.02, 11.95, 0.62, RGBColor(0xEC, 0xE7, 0xF7),
+        line=RGBColor(0xD2, 0xC7, 0xEA))
+    tf = textbox(s, 1.05, 3.02, 11.3, 0.62, anchor=MSO_ANCHOR.MIDDLE)
+    para(tf, "NO KEYS, NO GITHUB SECRETS — THIS STRING IS THE ENTIRE CREDENTIAL",
+         size=9.5, bold=True, color=ACCENT, space_after=3, first=True)
+    para(tf, "sub = repo:ClintPollock/britive-jit-demo:ref:refs/heads/main",
+         size=12.5, bold=True, color=INK, space_after=0, font="Consolas")
+
+    tf = textbox(s, 0.7, 3.86, 12.0, 0.3)
     para(tf, "WHAT THE CUSTOMER WATCHES", size=10, bold=True, color=ACCENT,
          space_after=0, first=True)
 
     # Panel height matches its content — 2.85 left a dead band at the bottom.
-    box(s, 0.7, 3.62, 11.95, 2.30, PANEL, line=RGBColor(0xE2, 0xDD, 0xEC))
-    tf = textbox(s, 1.05, 3.82, 11.3, 2.0)
+    box(s, 0.7, 4.16, 11.95, 2.18, PANEL, line=RGBColor(0xE2, 0xDD, 0xEC))
+    tf = textbox(s, 1.05, 4.32, 11.3, 1.9)
     para(tf, "“What did the pipeline drop today?”",
          size=15, bold=True, color=INK, space_after=2, first=True)
     para(tf, "43 records, $29,322 — different numbers every morning, because it really did run overnight.",
@@ -138,7 +149,7 @@ def slide_one(prs):
     para(tf, "…/cpollock-britive-s3-readonly-role/…@iam.serviceaccount.com",
          size=11.5, color=ACCENT, space_after=0, font="Consolas")
 
-    tf = textbox(s, 0.7, 6.18, 12.0, 0.4)
+    tf = textbox(s, 0.7, 6.58, 12.0, 0.4)
     para(tf, "Same AI. Same token. Same role. Two different identities in the audit log.",
          size=14, bold=True, color=INK, space_after=0, first=True)
 
