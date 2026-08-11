@@ -3,9 +3,13 @@
 **Before you start:** fully quit Claude Desktop (including the system tray icon) and
 reopen, so it picks up the current config.
 
+**Say "intake batch", not "the pipeline".** Asked about "the pipeline", Claude reasonably
+asks whether you mean Snowflake, CI/CD, or a sales pipeline — it has no way to know. If it
+ever hesitates, name the server: *"using the britive-jit-pipeline tools, …"*.
+
 ---
 
-### 1. *"What did the pipeline drop today?"*
+### 1. *"What's in today's nightly intake batch?"*
 
 Claude reads this morning's batch and summarises it: how many customers came in, total
 MRR, the plan and region mix, top accounts by revenue — and that the records carry

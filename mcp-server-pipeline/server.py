@@ -300,11 +300,14 @@ def pipeline_status() -> str:
 
 @mcp.tool()
 def whoami(as_identity: str = "user") -> str:
-    """Show the actual AWS identity a read would run as - the impersonation proof.
+    """Which cloud identity a read runs as - the impersonation contrast.
 
-    Call it twice, once with as_identity="agent" and once with "user", to see
-    the same Britive service identity produce two different cloud sessions:
-    the bot, and the human it is acting for.
+    USE THIS for "who did that run as?", "show me the same thing as the agent",
+    "run it as yourself instead of me", "whose credentials were used?".
+
+    as_identity="user" (default) acts on behalf of the human; "agent" acts as
+    the bot's own service identity. Same Britive token either way - only the
+    resulting cloud session differs.
     """
     try:
         with jit_credentials(as_identity) as creds:
@@ -329,7 +332,10 @@ def whoami(as_identity: str = "user") -> str:
 
 @mcp.tool()
 def list_batches(limit: int = 10, as_identity: str = "user") -> str:
-    """List the most recent nightly batches - proof the pipeline runs.
+    """History of the nightly pipeline: which batches exist in S3 and when.
+
+    USE THIS for "what batches are there?", "how far back does this go?",
+    "has it been running?", "show me recent drops".
 
     Each entry was written by a GitHub Actions run using a just-in-time
     credential that no longer exists.
@@ -362,7 +368,16 @@ def list_batches(limit: int = 10, as_identity: str = "user") -> str:
 
 @mcp.tool()
 def read_batch(batch_date: str = "today", as_identity: str = "user") -> str:
-    """Read and analyze a nightly intake batch: volume, MRR, plan and region mix.
+    """What the nightly data pipeline dropped today: customer intake batch from S3.
+
+    USE THIS for questions like "what did the pipeline drop today?", "what came
+    in overnight?", "what's in today's batch?", "summarise today's customer
+    data", "how much MRR came in?". This is the nightly GitHub Actions pipeline
+    that writes a customer intake batch to S3 - not a CI/CD, Snowflake, or
+    sales pipeline.
+
+    Returns volume, total MRR, plan and region mix, top accounts, and the AWS
+    identity the read actually ran as.
 
     batch_date is YYYY-MM-DD, or "today" for the most recent nightly drop.
     Defaults to reading AS THE HUMAN (as_identity="user") - the agent gets to
