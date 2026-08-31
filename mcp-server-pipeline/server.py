@@ -167,9 +167,27 @@ _ATEXIT_REGISTERED = False
 
 CLOUDS = ("aws", "gcp")
 
+# Written by the workflow, not readable here. Named so the tools can say so
+# accurately rather than implying Azure is not part of the pipeline.
+AZURE_ACCOUNT = os.environ.get("PIPELINE_AZURE_ACCOUNT", "britivejitdemo4bbb4f1c")
+AZURE_CONTAINER = os.environ.get("PIPELINE_AZURE_CONTAINER", "jit-demo")
+
 
 def _check_cloud(cloud: str) -> str:
     c = (cloud or "aws").strip().lower()
+    if c == "azure":
+        # A model that just sees "unsupported" concludes Azure is not part of
+        # the pipeline, which is false and embarrassing in front of a customer.
+        # Observed once already. State the actual situation instead.
+        raise PipelineError(
+            "Azure IS part of this pipeline - the same nightly batch is written to "
+            f"Azure Blob at {AZURE_ACCOUNT}/{AZURE_CONTAINER} by a third JIT identity, "
+            "every run, alongside S3 and GCS. What is missing is a READER: no Azure "
+            "reader profile exists yet, and the Azure app cannot scope a profile below "
+            "the subscription, so this server cannot fetch that copy. Tell the user the "
+            "batch is in Azure but cannot be read from here - do NOT say Azure is absent "
+            "from the pipeline."
+        )
     if c not in CLOUDS:
         raise PipelineError(f"cloud must be one of {CLOUDS}, got {cloud!r}")
     return c
@@ -680,6 +698,9 @@ def pipeline_status() -> str:
            "if back-to-back calls feel slow" if AGENT_PROFILE == PROFILE else ""),
         f"AWS bucket:     `s3://{BUCKET}`",
         f"GCS bucket:     `gs://{GCS_BUCKET}`  (profile `{GCP_PROFILE}`)",
+        f"Azure Blob:     `{AZURE_ACCOUNT}/{AZURE_CONTAINER}`  - WRITTEN nightly by a "
+        "third JIT identity, but there is no reader profile, so this server cannot "
+        "read that copy. Azure is in the pipeline; it is just not readable here.",
         f"Batch layout:   `{DAILY_PREFIX}/<YYYY-MM-DD>.csv` (+ `.manifest.json`)",
         f"Impersonates:   `{OBO_USER}` when a tool is called with as_identity='user'",
         "",
@@ -783,6 +804,11 @@ def list_batches(limit: int = 10, as_identity: str = "user", cloud: str = "aws")
     cloud="aws" (default) reads S3; cloud="gcp" reads the GCS copy of the same
     nightly batch. Use it for "is it in GCP too?" or "compare the clouds".
 
+    THREE clouds get this batch every night: S3, GCS and Azure Blob, each written
+    by its own JIT identity. This tool can read the first two. There is no Azure
+    reader yet - if asked about Azure, say the batch IS written there but cannot
+    be read from here, never that Azure is missing from the pipeline.
+
     cloud="gcp" is SLOWER than aws - Britive mints a fresh service account and
     Google's IAM binding takes time to propagate. Expect roughly 10-45s. If it
     returns a "grant had not propagated" message, do NOT call it again straight
@@ -834,9 +860,14 @@ def read_batch(batch_date: str = "latest", as_identity: str = "user", cloud: str
     Defaults to reading AS THE HUMAN (as_identity="user") - the agent gets to
     this data through the user's access, not its own.
 
-    cloud="aws" (default) or "gcp" - the same batch, written to two clouds by
-    two independent JIT identities, so the sha256 in the output should match
-    across both. cloud="gcp" requires as_identity="agent".
+    cloud="aws" (default) or "gcp" - the same batch, written by independent JIT
+    identities, so the sha256 in the output should match across both.
+    cloud="gcp" requires as_identity="agent".
+
+    THREE clouds get this batch every night: S3, GCS and Azure Blob, each written
+    by its own JIT identity. This tool can read the first two. There is no Azure
+    reader yet - if asked about Azure, say the batch IS written there but cannot
+    be read from here, never that Azure is missing from the pipeline.
 
     cloud="gcp" is SLOWER than aws - Britive mints a fresh service account and
     Google's IAM binding takes time to propagate. Expect roughly 10-45s. If it
