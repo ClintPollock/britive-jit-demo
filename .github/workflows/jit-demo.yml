@@ -447,10 +447,13 @@ jobs:
           d = json.load(open('/tmp/az.json'))
           for k in ('TenantId', 'ClientId', 'ClientSecret'):
               print(f"::add-mask::{d[k]}")
+          # Write what was VALIDATED. The check above strips before testing for
+          # emptiness, so writing the raw value could smuggle surrounding
+          # whitespace - or a newline, which would silently truncate the env var.
           with open(os.environ['GITHUB_ENV'], 'a') as f:
-              f.write(f"AZURE_TENANT_ID={d['TenantId']}\n")
-              f.write(f"AZURE_CLIENT_ID={d['ClientId']}\n")
-              f.write(f"AZURE_CLIENT_SECRET={d['ClientSecret']}\n")
+              f.write(f"AZURE_TENANT_ID={str(d['TenantId']).strip()}\n")
+              f.write(f"AZURE_CLIENT_ID={str(d['ClientId']).strip()}\n")
+              f.write(f"AZURE_CLIENT_SECRET={str(d['ClientSecret']).strip()}\n")
           PY
 
       - name: az login (retry while the new role assignment propagates)
@@ -459,11 +462,25 @@ jobs:
           # checkout, and ARM takes ~30-60s to recognise it. Until then az login
           # fails with "No subscriptions found". Measured locally: OK on attempt 3
           # (~45s). Retry rather than a fixed sleep so fast runs stay fast.
+          #
+          # USE `--password=` NOT `--password `. Run 33418984339 failed all 12
+          # attempts with:
+          #
+          #     ERROR: argument --password/-p: expected one argument
+          #
+          # which was previously written off as an EMPTY ClientSecret. It is not:
+          # the value is quoted, so an empty one would still be passed as a valid
+          # empty argument. argparse emits that message when the value itself
+          # STARTS WITH A HYPHEN — it reads `-Xy9...` as another option rather
+          # than as the value of --password. Britive mints a fresh secret on
+          # every checkout, so this bites only when the random secret happens to
+          # begin with `-`, which is exactly why it looked intermittent and
+          # unreproducible. The `--opt=value` form has no such ambiguity.
           for i in $(seq 1 12); do
             if az login --service-principal \
-                 --tenant "$AZURE_TENANT_ID" \
-                 --username "$AZURE_CLIENT_ID" \
-                 --password "$AZURE_CLIENT_SECRET" \
+                 --tenant="$AZURE_TENANT_ID" \
+                 --username="$AZURE_CLIENT_ID" \
+                 --password="$AZURE_CLIENT_SECRET" \
                  --output none 2>/tmp/azerr; then
               echo "::notice::az login succeeded on attempt $i (~$((i * 15))s of propagation)"
               exit 0
