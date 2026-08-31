@@ -55,6 +55,7 @@ import hashlib
 import io
 import json
 import os
+import threading
 import time
 from collections import Counter
 from datetime import datetime, timezone, date as _date
@@ -128,22 +129,41 @@ GCP_PROPAGATION_INTERVAL = float(os.environ.get("PIPELINE_GCP_PROPAGATION_INTERV
 # propagation wait twice inside one tool call.
 _GCP_LIVE: set[str] = set()
 
-# GCP credentials are HELD between calls; AWS ones are not.
+# Credentials are HELD between calls, on BOTH clouds.
 #
-# Why the asymmetry: a GCP checkout costs ~60s of Google IAM propagation before
-# the grant works, which is at or past the MCP client's per-tool timeout. Strict
-# per-call checkin means every single GCP read pays that toll and most of them
-# time out. So the GCP credential is checked out once, reused for
-# PIPELINE_GCP_SESSION_TTL seconds, then released. AWS is untouched and still
-# checks in before the tool returns - the stricter story stays available on the
-# cloud that can afford it.
+# Measured cost of one strict per-call AWS read (2026-08-31):
 #
-# What this costs, say it plainly on stage: for GCP the credential lives for the
-# conversation, not for the single call. It is still just-in-time and still
-# expires on its own; it is not per-question.
-GCP_SESSION_TTL = float(os.environ.get("PIPELINE_GCP_SESSION_TTL", "600"))
-_GCP_SESSION: dict | None = None
-_GCP_ATEXIT = False
+#     Britive client  0.86s   (already cached)
+#     CHECKOUT        4.12s
+#     boto3 client    0.33s
+#     s3 list         0.53s cold / 0.06s warm
+#     CHECKIN         0.89s
+#     ------------------------
+#     TOTAL           6.80s
+#
+# So ~5s of every 6.8s read was Britive round-trips, and on GCP the equivalent
+# toll (~60s of IAM propagation) exceeded the MCP client's tool timeout outright,
+# which made the client retry and mint yet another credential. Holding the
+# credential turns a read into just the cloud call: ~0.6s on AWS, ~0.9s on GCP.
+#
+# The lifetime is bounded by the GRANT, not by a guess: the checkout tells us
+# when it expires, and the session is dropped SESSION_EXPIRY_MARGIN seconds
+# before that, or after PIPELINE_SESSION_TTL, whichever comes first.
+#
+# WHAT THIS COSTS - say it plainly on stage: the credential lives for the
+# conversation, not for the single question. It is still just-in-time and still
+# self-expiring, but "that credential no longer exists" is now a claim about the
+# session, not the call. Set PIPELINE_SESSION_TTL=0 to restore strict per-call
+# checkin, or call the release_credentials tool to end a session on demand -
+# which is the honest way to stage the revocation beat.
+SESSION_TTL = float(os.environ.get("PIPELINE_SESSION_TTL", "600"))
+SESSION_EXPIRY_MARGIN = float(os.environ.get("PIPELINE_SESSION_EXPIRY_MARGIN", "60"))
+
+# Keyed by (cloud, as_identity) - NEVER by cloud alone. The agent and the
+# impersonated human check out different profiles and must never share a
+# credential, or an "as the human" read would quietly run as the bot.
+_SESSIONS: dict[tuple[str, str], dict] = {}
+_ATEXIT_REGISTERED = False
 
 CLOUDS = ("aws", "gcp")
 
@@ -192,6 +212,10 @@ class PipelineError(RuntimeError):
 # is the whole point of the demo.
 _BRITIVE: Britive | None = None
 _SESSION = boto3.session.Session()
+
+# Cloud SDK clients, keyed by the credential they were built from. Cleared
+# whenever a session is released, so a client can never outlive its grant.
+_CLIENTS: dict[tuple, object] = {}
 
 
 def _britive(fresh: bool = False) -> Britive:
@@ -253,42 +277,87 @@ def _checkin_profile(profile_path: str, headers: dict) -> None:
         pass
 
 
-def _release_gcp_session() -> None:
-    global _GCP_SESSION
-    if _GCP_SESSION:
-        _checkin_profile(_GCP_SESSION["profile"], _GCP_SESSION["headers"])
-        _GCP_LIVE.discard(_GCP_SESSION.get("sa", ""))
-        _GCP_SESSION = None
+def _grant_expiry_seconds(result: dict, creds: dict) -> float | None:
+    """Seconds until the GRANT itself dies, from whatever the checkout reported.
 
-
-def _gcp_session(profile_path: str, headers: dict) -> dict:
-    """Return a live GCP credential, checking one out only when needed.
-
-    The session is cached BEFORE the propagation wait, deliberately. If the
-    wait runs past the client's timeout, the credential is still held, so the
-    caller's next attempt reuses the same service account - which by then has
-    propagated - and returns immediately. Without that, every retry minted a
-    fresh account and restarted the wait, which is how this hung for minutes.
+    AWS credentials carry `expirationTime`; the checkout envelope carries
+    `expiration`. Either way the session must not outlive it.
     """
-    global _GCP_SESSION
-    now = time.monotonic()
-    if _GCP_SESSION and now < _GCP_SESSION["expires_at"]:
-        return _GCP_SESSION["creds"]
+    for source, field in ((creds, "expirationTime"), (result, "expiration")):
+        raw = source.get(field) if isinstance(source, dict) else None
+        if not raw:
+            continue
+        try:
+            when = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return (when - datetime.now(timezone.utc)).total_seconds()
+    return None
 
-    _release_gcp_session()
-    result = _checkout_profile(profile_path, headers, "agent")
+
+def _release_session(key: tuple[str, str]) -> bool:
+    sess = _SESSIONS.pop(key, None)
+    if not sess:
+        return False
+    _checkin_profile(sess["profile"], sess["headers"])
+    sa = sess.get("sa") or ""
+    _GCP_LIVE.discard(sa)
+    stale = {sa, (sess.get("creds") or {}).get("accessKeyID", "")}
+    for ck in [k for k in _CLIENTS if k[0] in stale or (len(k) > 1 and k[1] in stale)]:
+        _CLIENTS.pop(ck, None)
+    return True
+
+
+def release_all_sessions() -> list[str]:
+    """Check every held credential back in. Returns what was released."""
+    released = []
+    for key in list(_SESSIONS):
+        label = f"{key[0]} (as {'the human' if key[1] == 'user' else 'the agent'})"
+        if _release_session(key):
+            released.append(label)
+    return released
+
+
+def _session_credentials(
+    key: tuple[str, str], profile_path: str, headers: dict, as_identity: str
+) -> dict:
+    """A live credential for this (cloud, identity), checking out only if needed.
+
+    The session is stored BEFORE the caller does any propagation wait, and that
+    ordering matters on GCP: if the wait overruns the client's tool timeout, the
+    credential is still held, so the next attempt reuses the same service
+    account - which by then has propagated - instead of minting another one and
+    starting over. That is what turned a multi-minute retry spiral into a second
+    attempt that works.
+    """
+    sess = _SESSIONS.get(key)
+    if sess and time.monotonic() < sess["expires_at"]:
+        return sess["creds"]
+
+    _release_session(key)
+    result = _checkout_profile(profile_path, headers, as_identity)
     creds = result.get("credentials", result)
-    _GCP_SESSION = {
+
+    ttl = SESSION_TTL
+    grant_left = _grant_expiry_seconds(result, creds)
+    if grant_left is not None:
+        # Never hand back a credential the grant has already outlived.
+        ttl = min(ttl, max(0.0, grant_left - SESSION_EXPIRY_MARGIN))
+
+    _SESSIONS[key] = {
         "creds": creds,
-        "sa": _gcs_account(creds),
+        "sa": _gcs_account(creds) if key[0] == "gcp" else None,
         "profile": profile_path,
         "headers": headers,
-        "expires_at": now + GCP_SESSION_TTL,
+        "expires_at": time.monotonic() + ttl,
+        "ttl": ttl,
     }
-    global _GCP_ATEXIT
-    if not _GCP_ATEXIT:
-        atexit.register(_release_gcp_session)
-        _GCP_ATEXIT = True
+    global _ATEXIT_REGISTERED
+    if not _ATEXIT_REGISTERED:
+        atexit.register(release_all_sessions)
+        _ATEXIT_REGISTERED = True
     return creds
 
 
@@ -313,9 +382,9 @@ def jit_credentials(as_identity: str, cloud: str = "aws"):
     app, env, profile = _split_profile(profile_path)
     headers = {"X-On-Behalf-Of": OBO_USER} if as_identity == "user" else {}
 
-    if cloud == "gcp":
-        # Held, not per-call. See the GCP_SESSION_TTL note above.
-        yield _gcp_session(profile_path, headers)
+    if SESSION_TTL > 0:
+        # Held, not per-call. See the SESSION_TTL note above.
+        yield _session_credentials((cloud, as_identity), profile_path, headers, as_identity)
         return
 
     result = _checkout_profile(profile_path, headers, as_identity)
@@ -333,7 +402,7 @@ def _identity_label(as_identity: str) -> str:
     )
 
 
-def _gcs_client(creds: dict):
+def _gcs_client(creds: dict):  # noqa: D401 - cached below by SA email
     """Build a GCS client from a Britive GCP checkout.
 
     Britive returns `{"<jit-sa-email>": <service-account key JSON>}` - one
@@ -348,11 +417,16 @@ def _gcs_client(creds: dict):
         _sa_email, payload = next(iter(creds.items()))
     except StopIteration as exc:
         raise PipelineError("GCP checkout returned no credential") from exc
+    cached = _CLIENTS.get(("gcs", _sa_email))
+    if cached is not None:
+        return cached
     key = payload if isinstance(payload, dict) else json.loads(payload)
-    return storage.Client(
+    client = storage.Client(
         project=key.get("project_id"),
         credentials=service_account.Credentials.from_service_account_info(key),
     )
+    _CLIENTS[("gcs", _sa_email)] = client
+    return client
 
 
 def _gcs_account(creds: dict) -> str:
@@ -397,14 +471,21 @@ def _gcp_await_propagation(client, bucket: str, sa_email: str = ""):
 
 
 def _client(creds: dict, service: str = "s3"):
-    # Reuse the module-level Session so the service model is loaded once, not
-    # per call. The credentials are still per-checkout and never cached.
-    return _SESSION.client(
-        service,
-        aws_access_key_id=creds["accessKeyID"],
-        aws_secret_access_key=creds["secretAccessKey"],
-        aws_session_token=creds["sessionToken"],
-    )
+    # Reuse the module-level Session so the service model is loaded once, and
+    # cache the client per (credential, service) - constructing one costs ~0.33s,
+    # which is half the cost of a warm read. Keyed by access key id, so a new
+    # checkout gets a new client and nothing survives a release.
+    key = (creds.get("accessKeyID", ""), service)
+    client = _CLIENTS.get(key)
+    if client is None:
+        client = _SESSION.client(
+            service,
+            aws_access_key_id=creds["accessKeyID"],
+            aws_secret_access_key=creds["secretAccessKey"],
+            aws_session_token=creds["sessionToken"],
+        )
+        _CLIENTS[key] = client
+    return client
 
 
 # ── Storage (one shape for both clouds) ─────────────────────────────────────
@@ -562,18 +643,20 @@ def _footer(as_identity: str, arn: str | None = None, cloud: str = "aws") -> str
     # identity to the read that actually used it costs one extra STS call on a
     # credential already in hand (~0.3s) and removes that checkout entirely.
     ident = f"\n_Ran as:_ `{arn}`" if arn else ""
-    if cloud == "gcp":
-        # Honest about the trade-off made for GCP - see GCP_SESSION_TTL.
-        lifetime = (
-            "using a Britive credential checked out for this conversation and released "
-            f"automatically after {int(GCP_SESSION_TTL // 60)} minutes. Held rather than "
-            "per-call because a GCP checkout costs ~60s of IAM propagation. No standing "
-            "cloud credential exists."
-        )
-    else:
+    if SESSION_TTL <= 0:
         lifetime = (
             "using a Britive credential that was checked out for this call and checked "
             "back in before this text was returned. No standing cloud credential exists."
+        )
+    else:
+        # Do not overstate it: the credential is held for the session, and the
+        # honest claim is about the session, not the individual question.
+        mins = max(1, int(SESSION_TTL // 60))
+        lifetime = (
+            "using a Britive credential checked out for this conversation and released "
+            f"automatically within {mins} minutes - sooner if the grant expires first. "
+            "No standing cloud credential exists; ask me to release it and it is gone "
+            "immediately."
         )
     return f"\n\n---\n_Read as {_identity_label(as_identity)}, {lifetime}_{ident}"
 
@@ -607,11 +690,42 @@ def pipeline_status() -> str:
         f"3. `as_identity='user'` READS it as {OBO_USER} - the agent sees it *because the "
         "human can*, and the audit log names the human.",
         "",
-        "This server stores no cloud credential. Each tool call checks the profile "
-        "out, does one thing, and checks it back in.",
+        (
+            "This server stores no cloud credential at rest. A credential is checked "
+            f"out on first use and held for up to {max(1, int(SESSION_TTL // 60))} "
+            "minutes so reads stay fast, then released automatically - sooner if the "
+            "grant expires. Call `release_credentials` to end it immediately."
+            if SESSION_TTL > 0 else
+            "This server stores no cloud credential. Each tool call checks the profile "
+            "out, does one thing, and checks it back in."
+        ),
     ]
     if not TOKEN:
         lines += ["", "WARNING: BRITIVE_API_TOKEN is not set - every checkout will fail."]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def release_credentials() -> str:
+    """Check every held credential back in NOW - the revocation beat.
+
+    USE THIS for "release it", "give the credential back", "check it back in",
+    "revoke that access", "end the session". Reads hold their Britive
+    credential for the conversation so they are fast; this ends that
+    immediately. The next read checks out a brand new one.
+    """
+    released = release_all_sessions()
+    if not released:
+        return (
+            "Nothing was held - no credential is currently checked out. "
+            "There is no standing access to release."
+        )
+    lines = ["**Checked back in:**", ""] + [f"- {r}" for r in released]
+    lines += [
+        "",
+        "Those grants are gone. Britive has a checkin row for each, and the next "
+        "read will have to check out a new credential from scratch.",
+    ]
     return "\n".join(lines)
 
 
@@ -787,5 +901,32 @@ def read_manifest(batch_date: str = "latest", as_identity: str = "user", cloud: 
     return "\n".join(lines) + _footer(as_identity, cloud=cloud)
 
 
+def _prewarm() -> None:
+    """Absorb the GCP cold start before anyone asks a question.
+
+    GCP costs ~85s of IAM propagation on a cold checkout, spread over two calls
+    that both look slow to the user. Warming in the background at startup moves
+    that off the demo entirely: by the time the first question arrives the grant
+    is live and reads are ~0.2s.
+
+    OFF by default, and deliberately so: it checks out a GCP credential when the
+    server starts, whether or not anyone ever asks about GCP, and that is an
+    audit row and a held grant per launch. Set PIPELINE_PREWARM=gcp (or
+    "aws,gcp") when you want the speed and accept that.
+    """
+    targets = [c.strip().lower() for c in os.environ.get("PIPELINE_PREWARM", "").split(",")]
+    for cloud in [c for c in targets if c in CLOUDS]:
+        try:
+            with jit_credentials("agent", cloud) as creds:
+                if cloud == "gcp":
+                    _gcp_await_propagation(_gcs_client(creds), GCS_BUCKET, _gcs_account(creds))
+                else:
+                    _client(creds).list_objects_v2(Bucket=BUCKET, MaxKeys=1)
+        except Exception:  # noqa: BLE001 - warming must never break startup
+            pass
+
+
 if __name__ == "__main__":
+    if os.environ.get("PIPELINE_PREWARM"):
+        threading.Thread(target=_prewarm, daemon=True).start()
     mcp.run()
